@@ -409,9 +409,11 @@ async def fetch_douyin_search(mgr: BrowserManager, identity: Identity, keyword: 
     # 关键词搜索在抖音无头上下文中容易直接落到“验证码中间页”。批量任务可传入
     # 同账号的临时有头 context；普通调用仍沿用后台常驻 context。
     if context is not None:
-        page = next((candidate for candidate in context.pages
-                     if candidate.url == "about:blank"), None)
-        page = page or await context.new_page()
+        # The native startup tab belongs to the persistent browser context, not to
+        # a single search. Closing it at the end of the first keyword can close
+        # the only browser window and break subsequent keyword/comment reads.
+        # Use a dedicated task tab; only that tab is closed in finally.
+        page = await context.new_page()
     else:
         page = await mgr.new_page(identity, block_media)
 

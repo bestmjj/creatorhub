@@ -2,6 +2,8 @@ name: Build Windows installer
 
 on:
   push:
+    branches:
+      - fix/douyin-browser-tab-lifecycle
     tags:
       - "v*"
   workflow_dispatch:
@@ -37,7 +39,16 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           $version = $env:INPUT_VERSION
-          if ($env:GITHUB_EVENT_NAME -eq 'push') { $version = $env:GITHUB_REF_NAME.Substring(1) }
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              $version = $env:GITHUB_REF_NAME.Substring(1)
+            } else {
+              # Preview build: follow the newest numeric CHANGELOG release.
+              $heading = Get-Content CHANGELOG.md | Where-Object { $_ -match '^## \\[([0-9]+\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?)\\]' } | Select-Object -First 1
+              if (-not $heading) { throw 'Missing numeric CHANGELOG heading for preview build' }
+              $version = [regex]::Match($heading, '^## \\[([0-9]+\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?)\\]').Groups[1].Value
+            }
+          }
           if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$') { throw 'Use a numeric version such as v0.1.0; preview tags are not supported' }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           "value=$version" >> $env:GITHUB_OUTPUT

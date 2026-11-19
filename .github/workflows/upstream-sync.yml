@@ -1,0 +1,72 @@
+name: Sync upstream into browser fix branch
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai (01:00 UTC). GitHub scheduled runs can be delayed.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: creatorhub-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout maintained branch with full history
+        uses: actions/checkout@v4
+        with:
+          ref: fix/douyin-browser-tab-lifecycle
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Fetch and merge upstream/main without overwriting fixes
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/3441293738/creatorhub.git
+          git fetch --no-tags upstream main
+          before="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already contains the latest upstream/main commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Never use -X theirs, --force, or automatic conflict resolution.
+          if ! git merge --no-edit --no-ff upstream/main; then
+            git merge --abort || true
+            echo "Upstream merge conflict. No branch was overwritten." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          after="$(git rev-parse HEAD)"
+          if [[ "$after" == "$before" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin HEAD:refs/heads/fix/douyin-browser-tab-lifecycle
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Merged upstream/main into fix/douyin-browser-tab-lifecycle: $after" >> "$GITHUB_STEP_SUMMARY"
+      - name: Dispatch Windows installer build after upstream sync
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^## \\[([0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?)\\].*/\\1/p' CHANGELOG.md | head -n1)"
+          if [[ ! "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?$ ]]; then
+            echo "Cannot resolve numeric release version; refusing to dispatch." >&2
+            exit 1
+          fi
+          gh workflow run windows-installer.yml \
+            --ref fix/douyin-browser-tab-lifecycle -f "version=$version"
+          echo "Dispatched Windows preview build for version $version." >> "$GITHUB_STEP_SUMMARY"

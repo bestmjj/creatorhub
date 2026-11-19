@@ -238,10 +238,16 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 return None
 
-        page = Page()
+        startup = Page()
+        task = Page()
+        context = SimpleNamespace(
+            pages=[startup], new_page=AsyncMock(return_value=task))
         rows, error = await fetch_douyin_search(
             SimpleNamespace(), SimpleNamespace(), "数码", max_results=1,
-            context=SimpleNamespace(pages=[page]))
+            context=context)
+        context.new_page.assert_awaited_once()
+        self.assertEqual(startup.url, "about:blank")
+        self.assertTrue(task.url.startswith("https://www.douyin.com/search/"))
 
         self.assertEqual([row["aweme_id"] for row in rows],
                          ["stream-result-1"])
@@ -304,8 +310,10 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 return None
 
-        page = Page()
-        context = SimpleNamespace(pages=[page])
+        startup = Page()
+        task = Page()
+        context = SimpleNamespace(
+            pages=[startup], new_page=AsyncMock(return_value=task))
 
         rows, error = await fetch_douyin_search(
             SimpleNamespace(), SimpleNamespace(), "露营",
@@ -314,8 +322,11 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row["aweme_id"] for row in rows], ["page-result-1"])
         self.assertEqual(error, "")
-        self.assertEqual(page.evaluate_calls, 0)
-        self.assertEqual(page.mouse.wheel.await_count, 0)
+        context.new_page.assert_awaited_once()
+        self.assertEqual(startup.url, "about:blank")
+        self.assertEqual(startup.wait_calls, 0)
+        self.assertEqual(task.evaluate_calls, 0)
+        self.assertEqual(task.mouse.wheel.await_count, 0)
 
 class KeywordCollectionPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

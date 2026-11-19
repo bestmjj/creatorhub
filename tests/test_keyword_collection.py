@@ -218,6 +218,7 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
         class Page:
             def __init__(self):
                 self.url = "about:blank"
+                self.closed = False
                 self.handler = None
                 self.mouse = SimpleNamespace(wheel=AsyncMock())
 
@@ -236,7 +237,7 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def close(self):
-                return None
+                self.closed = True
 
         startup = Page()
         task = Page()
@@ -248,11 +249,23 @@ class DouyinPageSearchTests(unittest.IsolatedAsyncioTestCase):
         context.new_page.assert_awaited_once()
         self.assertEqual(startup.url, "about:blank")
         self.assertTrue(task.url.startswith("https://www.douyin.com/search/"))
-
-        self.assertEqual([row["aweme_id"] for row in rows],
-                         ["stream-result-1"])
+        self.assertTrue(task.closed)
+        self.assertFalse(startup.closed)
+        self.assertEqual([row["aweme_id"] for row in rows], ["stream-result-1"])
         self.assertEqual(error, "")
-        page.mouse.wheel.assert_not_awaited()
+        task.mouse.wheel.assert_not_awaited()
+
+        # The first keyword must not close the initial blank window.
+        second = Page()
+        context.new_page = AsyncMock(return_value=second)
+        rows2, error2 = await fetch_douyin_search(
+            SimpleNamespace(), SimpleNamespace(), "软装", max_results=1,
+            context=context)
+        context.new_page.assert_awaited_once()
+        self.assertEqual([row["aweme_id"] for row in rows2], ["stream-result-1"])
+        self.assertEqual(error2, "")
+        self.assertTrue(second.closed)
+        self.assertFalse(startup.closed)
 
     async def test_verification_wait_is_passive_and_page_response_resumes_collection(self):
         verify_payload = {

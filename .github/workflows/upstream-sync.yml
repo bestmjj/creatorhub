@@ -62,8 +62,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(sed -nE 's/^## \\[([0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?)\\].*/\\1/p' CHANGELOG.md | head -n1)"
-          if [[ ! "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?$ ]]; then
+          version="$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)\].*/\1/p' CHANGELOG.md | head -n1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "Cannot resolve numeric release version; refusing to dispatch." >&2
             exit 1
           fi

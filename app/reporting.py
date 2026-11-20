@@ -983,6 +983,8 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
             url = explicit_url
         elif platform == "xhs":
             url = f"https://www.xiaohongshu.com/explore/{aweme_id}"
+        elif platform == "rednote":
+            url = f"https://www.rednote.com/zh/discovery/item/{aweme_id}"
         elif platform == "kuaishou":
             url = f"https://www.kuaishou.com/short-video/{aweme_id}"
         elif platform == "bilibili":
@@ -991,6 +993,8 @@ def build_keyword_collection_report(job: Any, contents: Sequence[Any],
                 if aweme_id.upper().startswith("BV1")
                 else f"https://www.bilibili.com/opus/{aweme_id}"
             )
+        elif platform == "instagram":
+            url = f"https://www.instagram.com/p/{aweme_id}/"
         else:
             url = f"https://www.douyin.com/video/{aweme_id}"
         content_rows.append((

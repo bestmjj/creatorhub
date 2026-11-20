@@ -77,6 +77,30 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
     {"platform": "xhs", "operation": "follows", "label": "关注/粉丝列表",
      "setting": "", "fixed": "unavailable", "api": False, "browser": False,
      "note": "网页端未提供该列表"},
+    # Rednote (海外小红书): strictly isolated rednote.com 4-domain boundary + XYS/XYW+b1 API & RPA.
+    {"platform": "rednote", "operation": "public_monitor", "label": "作品/关键词/收藏与公开评论读取",
+     "setting": "rednote_read_mode", "default": "hybrid", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "rednote.com Cookie + XYS / XYW + b1 / dsllt + a1",
+     "wire_protocol": "HTTPS JSON + SSR __INITIAL_STATE__"},
+    {"platform": "rednote", "operation": "account_works", "label": "本账号资料/作品同步与可见性删除管理",
+     "setting": "rednote_read_mode", "default": "hybrid", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "webapi.rednote.com + creator.rednote.com XYS/XYW + b1",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "rednote", "operation": "publish", "label": "图文与视频笔记发布",
+     "setting": "rednote_publish_mode", "default": "browser", "api": True, "browser": True,
+     "auth_protocol": "creator.rednote.com RPA / 实验性 XYS + b1 + x-rap-param (//webapi.rednote.com)",
+     "wire_protocol": "COS upload + HTTPS JSON"},
+    {"platform": "rednote", "operation": "comment_write", "label": "评论写入与自动计划",
+     "setting": "", "fixed": "unavailable", "api": False, "browser": False,
+     "note": "海外小红书暂未开放评论写入与自动计划"},
+    {"platform": "rednote", "operation": "dm_sync", "label": "私信会话/自动回复",
+     "setting": "", "fixed": "unavailable", "api": False, "browser": False,
+     "note": "海外小红书暂未开放国内 RWP 私信协议通道"},
+    {"platform": "rednote", "operation": "follows", "label": "关注/粉丝列表",
+     "setting": "", "fixed": "unavailable", "api": False, "browser": False,
+     "note": "网页端未提供该列表"},
     # Platforms without a supported direct transport remain explicit rather
     # than being silently grouped under a global API selector.
     {"platform": "kuaishou", "operation": "account_management", "label": "作品/评论/关注/写入",
@@ -136,6 +160,45 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
      "setting": "", "fixed": "browser", "api": False, "browser": True,
      "auth_protocol": "member.bilibili.com RPA + add/v3 payload merge",
      "wire_protocol": "UPOS + HTTPS JSON"},
+    # Instagram Mobile API v1 (Bearer IGT:2 + SIGNATURE.) + Web Session HTTP + Web RPA.
+    {"platform": "instagram", "operation": "public_monitor", "label": "主页/话题/Reels/评论读取",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + Web Cookie / X-CSRFToken",
+     "wire_protocol": "HTTPS JSON + chunked NDJSON (clips/user)"},
+    {"platform": "instagram", "operation": "account_works", "label": "本账号资料与作品列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + response header token writeback",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "following_list", "label": "关注列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + RankTokenCache (/friendships/following/)",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "followers_list", "label": "粉丝列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + RankTokenCache (/friendships/followers/)",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "dm_sync", "label": "Direct v2 私信收件箱与历史同步",
+     "setting": "instagram_read_mode", "api": True, "browser": False,
+     "auth_protocol": "Bearer IGT:2 + Web direct_v2/inbox fallback",
+     "wire_protocol": "HTTPS JSON (microsecond timestamp)"},
+    {"platform": "instagram", "operation": "comment_write", "label": "评论/回复/点赞与关注",
+     "setting": "instagram_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "signed_body=SIGNATURE. + HMAC-SHA256 user_breadcrumb",
+     "wire_protocol": "x-www-form-urlencoded"},
+    {"platform": "instagram", "operation": "dm_send", "label": "Direct v2 私信发送(文本/链接/图视)",
+     "setting": "instagram_write_mode", "api": True, "browser": False,
+     "auth_protocol": "Bearer IGT:2 + unique_time_id client_context",
+     "wire_protocol": "x-www-form-urlencoded (broadcast/text | link | configure_*)"},
+    {"platform": "instagram", "operation": "publish", "label": "图文/轮播/Reels/快拍发布",
+     "setting": "instagram_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first", "native_browser_override": True,
+     "auth_protocol": "rupload_igphoto/igvideo + %20 SIGNATURE. configure + Web RPA",
+     "wire_protocol": "Binary stream + x-www-form-urlencoded"},
 )
 
 
@@ -219,8 +282,9 @@ def resolve_transport(cfg: Any, platform: str, operation: str,
     """Return configured and effective transport for one operation."""
     spec = transport_spec(platform, operation)
     setting = str(spec.get("setting") or "")
+    fallback_default = str(spec.get("default") or "browser")
     configured = str(spec.get("fixed") or (
-        _setting_value(cfg, setting) if setting else "browser"))
+        _setting_value(cfg, setting, fallback_default) if setting else fallback_default))
     effective = configured
     reason = ""
 
@@ -388,12 +452,16 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "douyin_publish_mode": _setting_value(cfg, "douyin_publish_mode", "browser"),
             "douyin_write_mode": _setting_value(cfg, "douyin_write_mode", "hybrid"),
             "xhs_read_mode": _setting_value(cfg, "xhs_read_mode", "api"),
+            "rednote_read_mode": _setting_value(cfg, "rednote_read_mode", "hybrid"),
+            "rednote_publish_mode": _setting_value(cfg, "rednote_publish_mode", "browser"),
             "xhs_publish_mode": _setting_value(cfg, "xhs_publish_mode", "browser"),
             "xhs_comment_write_mode": _setting_value(
                 cfg, "xhs_comment_write_mode", "browser"),
             "channels_read_mode": _setting_value(cfg, "channels_read_mode", "auto"),
             "bilibili_read_mode": _setting_value(cfg, "bilibili_read_mode", "hybrid"),
             "bilibili_write_mode": _setting_value(cfg, "bilibili_write_mode", "hybrid"),
+            "instagram_read_mode": _setting_value(cfg, "instagram_read_mode", "hybrid"),
+            "instagram_write_mode": _setting_value(cfg, "instagram_write_mode", "hybrid"),
             "channels_cdp_configured": channels_readiness["configured"],
             "channels_cdp_ready": channels_readiness["ready"],
             "channels_cdp_source": channels_readiness["source"],

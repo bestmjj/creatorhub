@@ -1,5 +1,5 @@
-"""监控引擎。对应逆向 engine.MonitorEngine + ContentChecker。
-后台循环:到点的目标 -> 真实浏览器抓新作品 -> 入库 -> 下载。
+"""多平台监控、发布与社交互动调度引擎。
+后台循环:到点的目标 -> 抓取新作品与评论 -> 入库 -> 下载与通知。
 """
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_self_profile,
                        fetch_xhs_notes, fetch_xhs_search, fetch_xhs_note_detail,
                        fetch_xhs_comments, fetch_xhs_self_profile,
+                       fetch_rednote_notes, fetch_rednote_search, fetch_rednote_note_detail,
+                       fetch_rednote_comments, fetch_rednote_self_profile,
                        post_comment_browser,
                        fetch_ks_videos, fetch_ks_comments, fetch_ks_self_profile,
                        post_ks_comment,
@@ -29,6 +31,8 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_channels_self_profile, post_channels_comment,
                        fetch_bili_videos, fetch_bili_search, fetch_bili_comments,
                        fetch_bili_self_profile, post_bili_comment,
+                       fetch_ig_posts, fetch_ig_search, fetch_ig_comments,
+                       fetch_ig_self_profile, post_ig_comment,
                        fetch_account_works, fetch_douyin_account_works_api,
                        do_follow, send_dm, send_dm_api,
                        douyin_secure_post_api)
@@ -57,6 +61,20 @@ from ..platforms.xhs import (parse_note_brief, parse_note_detail,
                    parse_self_user as parse_xhs_self_user,
                    XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
                    publish_xhs, creator_check, comment_xhs_browser)
+from ..platforms.rednote import (
+    RednoteApiClient,
+    RednoteApiError,
+    cookie_str_from_state as rednote_cookie_str_from_state,
+    flatten_rednote_comments,
+    has_a1 as rednote_has_a1,
+    parse_rednote_brief,
+    parse_rednote_comment,
+    parse_rednote_detail,
+    parse_rednote_self_user,
+    publish_rednote,
+    rednote_creator_check,
+    weighted_truncate,
+)
 from ..platforms.kuaishou import (parse_ks_feed, parse_ks_comment,
                    flatten_ks_comments, parse_self_user as parse_ks_self_user,
                    publish_kuaishou)
@@ -76,6 +94,12 @@ from ..platforms.bilibili import (
     cookie_map_from_state as bili_cookie_map,
     parse_bili_aweme,
     publish_bilibili,
+)
+from ..platforms.instagram import (
+    InstagramClient,
+    cookie_map_from_state as ig_cookie_map,
+    parse_ig_aweme,
+    publish_instagram,
 )
 from ..platforms.tiktok.urls import profile_url as tiktok_profile_url
 from ..platforms.tiktok.urls import video_url as tiktok_video_url
@@ -762,6 +786,12 @@ class MonitorEngine:
     def _xhs_publish_mode(self) -> str:
         """Use visible page publishing unless API compatibility is explicit."""
         mode = str(getattr(self.cfg.engine, "xhs_publish_mode", "browser")
+                   or "browser").strip().lower()
+        return mode if mode in {"browser", "api"} else "browser"
+
+    def _rednote_publish_mode(self) -> str:
+        """Use creator RPA unless experimental pure-API Rednote publishing is explicit."""
+        mode = str(getattr(self.cfg.engine, "rednote_publish_mode", "browser")
                    or "browser").strip().lower()
         return mode if mode in {"browser", "api"} else "browser"
 
@@ -1459,6 +1489,63 @@ class MonitorEngine:
                     auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
                     if bmode == "browser" or (not u and bmode == "hybrid" and not auth_failed):
                         u, err = await fetch_bili_self_profile(self.browser, identity)
+                elif platform == "rednote":
+                    rmode = self._rednote_read_mode()
+                    u, err = {}, ""
+                    rn_state = state or creator_state
+                    if rmode in {"api", "hybrid"} and rn_state:
+                        rcli = self._rednote_client(identity, rn_state, proxy)
+                        if rcli is not None:
+                            try:
+                                async with rcli.session_scope():
+                                    data = await rcli.self_info()
+                                u, err = (
+                                    (data, "")
+                                    if data and not data.get("guest")
+                                    else ({}, "logged_out")
+                                )
+                            except RednoteApiError as exc:
+                                if exc.category == "auth":
+                                    u, err = {}, "logged_out"
+                                elif rmode == "api":
+                                    self.risk.record_failure(
+                                        aid, OperationKind.READ_LIGHT, exc)
+                                    return {"ok": False, "error": str(exc)}
+                                else:
+                                    err = str(exc)
+                        elif creator_state:
+                            chk = await rednote_creator_check(creator_state, proxy=proxy)
+                            if chk:
+                                u, err = {"ok": 1}, ""
+                            elif chk is False and rmode == "api":
+                                u, err = {}, "logged_out"
+                        elif rmode == "api":
+                            u, err = {}, "logged_out"
+                    elif rmode == "api":
+                        u, err = {}, "logged_out"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if rmode == "browser" or (not u and rmode == "hybrid" and not auth_failed):
+                        u, err = await fetch_rednote_self_profile(self.browser, identity)
+                elif platform == "instagram":
+                    imode = str(getattr(
+                        self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+                    u, err = {}, ""
+                    if imode in {"api", "hybrid"} and state:
+                        icli = InstagramClient(
+                            state,
+                            identity.ua or self.cfg.engine.user_agent,
+                            proxy=proxy,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+                            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+                        )
+                        async with icli.session_scope():
+                            u, err = await icli.fetch_self_profile()
+                    elif imode == "api" and not state:
+                        u, err = {}, "logged_out:缺少 Instagram 登录态"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if imode == "browser" or (not u and imode == "hybrid" and not auth_failed):
+                        u, err = await fetch_ig_self_profile(self.browser, identity)
                 else:
                     u, err = await fetch_self_profile(self.browser, identity)
                 if u:
@@ -1479,6 +1566,8 @@ class MonitorEngine:
             if u:
                 if platform == "xhs":
                     parsed = parse_xhs_self_user(u)
+                elif platform == "rednote":
+                    parsed = parse_rednote_self_user(u)
                 elif platform == "kuaishou":
                     parsed = parse_ks_self_user(u)
                 elif platform == "shipinhao":
@@ -1493,7 +1582,7 @@ class MonitorEngine:
                         "following_count": int(u.get("following_count") or 0),
                         "aweme_count": int(u.get("video_count") or 0),
                     }
-                elif platform == "bilibili":
+                elif platform in {"bilibili", "instagram"}:
                     parsed = dict(u)
                 else:
                     parsed = parse_self_user(u)
@@ -1506,7 +1595,7 @@ class MonitorEngine:
                     account.uid = str(parsed["uid"])
                 account.douyin_id = parsed.get("douyin_id") or account.douyin_id
                 account.avatar = parsed.get("avatar") or account.avatar
-                if platform in {"kuaishou", "tiktok", "bilibili"}:
+                if platform in {"kuaishou", "tiktok", "bilibili", "instagram"}:
                     account.follower_count = int(parsed.get("follower_count") or 0)
                     account.following_count = int(parsed.get("following_count") or 0)
                     account.aweme_count = int(parsed.get("aweme_count") or 0)
@@ -1606,7 +1695,9 @@ class MonitorEngine:
             return
         self._last_work_health = now
         with get_session() as s:
-            accs = [(a.id, a.platform, a.sec_uid or "", self.browser.identity_for(a))
+            accs = [(a.id, a.platform,
+                     (a.sec_uid or a.uid or a.douyin_id or "") if a.platform == "instagram" else (a.sec_uid or ""),
+                     self.browser.identity_for(a))
                     for a in s.exec(select(DouyinAccount)).all()
                     if a.status != "invalid" and (a.storage_state or a.creator_storage_state)]
         for aid, platform, uid, identity in accs:
@@ -2022,6 +2113,254 @@ class MonitorEngine:
             "error": error,
         }
 
+    async def _scan_instagram_target_locked(self, target_id: int) -> dict:
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "target not found"}
+            first_scan = target.last_scan_at is None
+            if not target.account_id:
+                return self._mark_target_skip(
+                    target_id, "Instagram 作品监控必须绑定已登录的 Instagram 账号"
+                )
+            acc = s.get(DouyinAccount, target.account_id)
+            if not acc or acc.platform != "instagram" or acc.status != "active":
+                return self._mark_target_skip(
+                    target_id, "绑定的 Instagram 账号不存在或登录态已失效，请重新绑定/登录"
+                )
+            if self._proxy_bad(acc):
+                return self._mark_target_skip(
+                    target_id, "账号代理标记为不可用(proxy bad)，已跳过以免暴露真实 IP"
+                )
+            identity = (
+                self.browser.identity_for(acc)
+                if callable(getattr(self.browser, "identity_for", None))
+                else None
+            )
+            proxy = acc.proxy or ""
+            state = acc.storage_state or acc.creator_storage_state or acc.cookie or ""
+            ua = acc.ua or self.cfg.engine.user_agent
+            account_seed = (
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else (acc.fp_seed or acc.profile_dir or "")
+            )
+            tz_id = (
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else (acc.timezone_id or "Asia/Shanghai")
+            )
+            known = set(
+                s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
+            )
+            known_create_times = list(
+                s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
+            )
+            target_kind = target.target_kind or "creator"
+            sec_uid = (target.sec_uid or "").strip()
+            keyword = (target.keyword or "").strip()
+            base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
+            monitor_since = int(target.created_at.timestamp())
+            scan_since = _douyin_scan_since(monitor_since, known_create_times)
+            backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
+            auto_download = target.download_enabled
+            media_filter = target.media_filter or "all"
+            strategy = _monitor_strategy(target, default_scrolls=4, default_items=0)
+
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=account_seed,
+            timezone_id=tz_id,
+        )
+        raw_items: list[dict] = []
+        author_name = ""
+        author_avatar = ""
+        error = ""
+
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                max_pages = max(1, min(6, strategy["max_scrolls"] or 2))
+                if target_kind == "keyword":
+                    raw_items, error = await icli.search_posts(keyword, max_pages=max_pages)
+                else:
+                    cursor = ""
+                    for _ in range(max_pages):
+                        batch, next_cursor, more, err = await icli.fetch_user_feed(
+                            sec_uid, max_id=cursor
+                        )
+                        if err:
+                            error = err
+                            break
+                        raw_items.extend(batch)
+                        if (
+                            not more
+                            or not next_cursor
+                            or next_cursor == cursor
+                            or (
+                                known
+                                and batch
+                                and all(
+                                    (parse_ig_aweme(r, require_media=False) is not None)
+                                    and parse_ig_aweme(r, require_media=False).aweme_id in known  # type: ignore[union-attr]
+                                    for r in batch
+                                )
+                            )
+                        ):
+                            break
+                        cursor = next_cursor
+
+            auth_failed = classify_platform_error(error)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not raw_items and error and not auth_failed)
+            ) and identity is not None:
+                scrolls = max(1, min(4, strategy["max_scrolls"] or 2))
+                if target_kind == "keyword":
+                    b_items, b_err = await fetch_ig_search(
+                        self.browser, identity, keyword, max_scrolls=scrolls
+                    )
+                    if b_items:
+                        raw_items, error = b_items, ""
+                    elif mode == "browser":
+                        error = b_err
+                else:
+                    b_items, b_author, b_err = await fetch_ig_posts(
+                        self.browser, identity, sec_uid, known, max_scrolls=scrolls
+                    )
+                    if b_items:
+                        raw_items, error = b_items, ""
+                        if isinstance(b_author, dict):
+                            author_name = str(b_author.get("nickname") or author_name)
+                            author_avatar = str(b_author.get("avatar") or author_avatar)
+                    elif mode == "browser":
+                        error = b_err
+
+            candidates: list[Aweme] = []
+            seen_ids: set[str] = set()
+            for r in raw_items:
+                aw = parse_ig_aweme(r, require_media=False)
+                if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
+                    continue
+                seen_ids.add(aw.aweme_id)
+                if aw.author_name and not author_name and target_kind == "creator":
+                    author_name = aw.author_name
+                if aw.avatar and not author_avatar and target_kind == "creator":
+                    author_avatar = aw.avatar
+                candidates.append(aw)
+
+            candidates.sort(key=lambda a: int(a.create_time or 0), reverse=True)
+            if should_backfill:
+                if backfill_count == 0:
+                    candidates = [a for a in candidates if not a.create_time or a.create_time >= monitor_since]
+                elif backfill_count > 0:
+                    candidates = candidates[:backfill_count]
+            else:
+                candidates = [a for a in candidates if not a.create_time or a.create_time >= scan_since]
+
+            new_records = []
+            filtered_count = 0
+            for aw in candidates:
+                if not _monitor_content_matches(aw, strategy):
+                    filtered_count += 1
+                    continue
+                if strategy["max_items"] and len(new_records) >= strategy["max_items"]:
+                    break
+                should_download = auto_download and (
+                    media_filter == "all" or aw.media_type == media_filter
+                )
+                media_err = ""
+                if should_download and not aw.medias:
+                    full_aw, _raw_m, media_err = await icli.fetch_media_info(aw.aweme_id)
+                    if full_aw is not None and full_aw.medias:
+                        aw = full_aw
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                    }
+                    for m in aw.medias
+                ])
+                rec = ContentRecord(
+                    platform="instagram",
+                    target_id=target_id,
+                    aweme_id=aw.aweme_id,
+                    desc=aw.desc,
+                    media_type=aw.media_type,
+                    quality=aw.quality_label,
+                    create_time=aw.create_time,
+                    cover_url=aw.cover or "",
+                    like_count=aw.like_count,
+                    comment_count=aw.comment_count,
+                    duration=aw.duration,
+                    media_json=media_json,
+                    download_status="pending" if (should_download and aw.medias) else (
+                        "failed" if should_download else "skipped"
+                    ),
+                    error=(
+                        (media_err or "未获取到 Instagram 媒体直链")
+                        if (should_download and not aw.medias)
+                        else ""
+                    ),
+                )
+                new_records.append((rec, aw, bool(should_download and aw.medias)))
+
+        target_name = ""
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = error
+                if target_kind == "creator":
+                    if author_name and not t.nickname:
+                        t.nickname = author_name
+                    if author_avatar and not t.avatar:
+                        t.avatar = author_avatar
+                target_name = t.nickname or t.keyword or t.sec_uid
+                s.add(t)
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        for rec, aw, should_download in new_records:
+            if not should_download:
+                continue
+            ok, path, dl_err = await self.downloader.download_aweme(
+                aw,
+                base_dir,
+                self._dl_proxy(proxy),
+                user_agent=ua,
+                referer="https://www.instagram.com/",
+            )
+            with get_session() as s:
+                r = s.get(ContentRecord, rec.id)
+                if r:
+                    r.download_status = "done" if ok else "failed"
+                    r.local_path = path
+                    r.error = dl_err
+                    s.add(r)
+                    s.commit()
+
+        if not first_scan and new_records:
+            await self._notify_new_works(target_name, [aw for _, aw, _ in new_records])
+        return {
+            "ok": not error,
+            "new": len(new_records),
+            "new_works": len(new_records),
+            "scanned": len(candidates),
+            "filtered": filtered_count,
+            "backfill_count": backfill_count,
+            "error": error,
+        }
+
     async def _scan_target_locked(self, target_id: int) -> dict:
         with get_session() as s:
             t0 = s.get(MonitorTarget, target_id)
@@ -2030,6 +2369,8 @@ class MonitorEngine:
             platform = t0.platform
         if platform == "xhs":
             return await self._scan_xhs_target_locked(target_id)
+        if platform == "rednote":
+            return await self._scan_rednote_target_locked(target_id)
         if platform == "kuaishou":
             return await self._scan_ks_target_locked(target_id)
         if platform == "tiktok":
@@ -2038,6 +2379,8 @@ class MonitorEngine:
             return await self._scan_channels_target_locked(target_id)
         if platform == "bilibili":
             return await self._scan_bilibili_target_locked(target_id)
+        if platform == "instagram":
+            return await self._scan_instagram_target_locked(target_id)
         with get_session() as s:
             target = s.get(MonitorTarget, target_id)
             if not target:
@@ -2144,7 +2487,11 @@ class MonitorEngine:
             if not target:
                 return {"ok": False, "error": "target not found"}
             first_scan = target.last_scan_at is None
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             proxy = ""
             if target.account_id:
                 acc = s.get(DouyinAccount, target.account_id)
@@ -2346,7 +2693,11 @@ class MonitorEngine:
             if not target:
                 return {"ok": False, "error": "target not found"}
             is_first_scan = target.last_scan_at is None
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             proxy = ""
             acc_sec_uid = ""
             has_active_account = False
@@ -2513,7 +2864,11 @@ class MonitorEngine:
             xsec_token = target.xsec_token or ""
             state = ""
             proxy = ""
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             if target.account_id:
                 acc = s.get(DouyinAccount, target.account_id)
                 if acc:
@@ -2522,7 +2877,11 @@ class MonitorEngine:
                             target_id, "账号代理标记为不可用(proxy bad),已跳过以免暴露真实 IP")
                     state = acc.storage_state or ""
                     proxy = acc.proxy or ""
-                    identity = self.browser.identity_for(acc)
+                    identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
             known = set(s.exec(
                 select(ContentRecord.aweme_id)
                 .where(ContentRecord.target_id == target_id)).all())
@@ -2707,8 +3066,16 @@ class MonitorEngine:
                 continue
             should_download = bool(aw.medias) and auto_download and (
                 media_filter == "all" or aw.media_type == media_filter)
-            media_json = json.dumps([{"url": m.url, "kind": m.kind, "ext": m.ext,
-                                      "index": m.index} for m in aw.medias]) if aw.medias else ""
+            media_json = json.dumps([
+                {
+                    "url": m.url,
+                    "kind": m.kind,
+                    "ext": m.ext,
+                    "index": m.index,
+                    **({"backup_urls": m.backup_urls} if getattr(m, "backup_urls", None) else {}),
+                }
+                for m in aw.medias
+            ]) if aw.medias else ""
             rec = ContentRecord(
                 platform="xhs", target_id=target_id, aweme_id=aw.aweme_id, desc=aw.desc,
                 media_type=aw.media_type, quality=aw.quality_label,
@@ -2773,6 +3140,309 @@ class MonitorEngine:
         await asyncio.gather(*(self._download(rec.id, aw, base_dir, proxy)
                                for rec, aw, should_download in new_records
                                if should_download))
+        return {"ok": not error, "new": len(new_records), "error": error,
+                "scanned": detail_attempts, "filtered": filtered_count,
+                "captured": len(captured), "failed": detail_failures,
+                "partial": bool(captured and error), "refreshed": refreshed_access}
+
+    # ── 海外小红书(Rednote):创作者笔记 / 关键词 监控 ──
+    async def _scan_rednote_target_locked(self, target_id: int) -> dict:
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "target not found"}
+            first_scan = target.last_scan_at is None
+            kind = target.target_kind
+            user_id, keyword = target.sec_uid, target.keyword
+            xsec_token = target.xsec_token or ""
+            state = ""
+            proxy = ""
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
+            if target.account_id:
+                acc = s.get(DouyinAccount, target.account_id)
+                if acc:
+                    if self._proxy_bad(acc):
+                        return self._mark_target_skip(
+                            target_id, "账号代理标记为不可用(proxy bad),已跳过以免暴露真实 IP")
+                    state = acc.storage_state or acc.creator_storage_state or ""
+                    proxy = acc.proxy or ""
+                    if callable(getattr(self.browser, "identity_for", None)):
+                        identity = self.browser.identity_for(acc)
+            known = set(s.exec(
+                select(ContentRecord.aweme_id)
+                .where(ContentRecord.target_id == target_id)).all())
+            failed_access = {
+                row.aweme_id: (row.id, row.xsec_token, row.xsec_source)
+                for row in s.exec(select(ContentRecord).where(
+                    ContentRecord.target_id == target_id,
+                    ContentRecord.download_status == "failed")).all()
+                if not _loads(row.media_json)
+            }
+            base_dir = target.download_dir or get_setting(
+                "download_dir", self.cfg.engine.media_dir)
+            auto_download = target.download_enabled
+            media_filter = target.media_filter or "all"
+            strategy = _monitor_strategy(
+                target, default_scrolls=6, default_items=12)
+            configured_max_items = max(0, int(target.max_items_per_scan or 0))
+
+        detail_budget = int(strategy["max_items"] or 0)
+        if detail_budget > 4 and not configured_max_items:
+            detail_budget = random.randint(4, min(8, detail_budget))
+
+        rmode = self._rednote_read_mode()
+        cookie_str = rednote_cookie_str_from_state(state)
+        if not state:
+            msg = "海外小红书监控需要绑定一个已登录的海外小红书账号"
+            with get_session() as s:
+                t = s.get(MonitorTarget, target_id)
+                if t:
+                    t.last_scan_at = datetime.utcnow()
+                    t.last_error = msg
+                    s.add(t); s.commit()
+            return {"ok": False, "new": 0, "error": msg}
+
+        client = self._rednote_client(identity, state, proxy) if rmode in {"api", "hybrid"} else None
+        if rmode == "api" and client is None:
+            msg = "海外小红书直连模式需要登录态包含 a1 Cookie，请重新扫码登录或切换浏览器读取"
+            with get_session() as s:
+                t = s.get(MonitorTarget, target_id)
+                if t:
+                    t.last_scan_at = datetime.utcnow()
+                    t.last_error = msg
+                    s.add(t); s.commit()
+            return {"ok": False, "new": 0, "error": msg}
+
+        use_browser = rmode == "browser" or client is None
+        error: object = ""
+        author = None
+        briefs_raw: list = []
+        try:
+            if not use_browser and client is not None:
+                async with client.session_scope():
+                    if kind == "keyword":
+                        briefs_raw = await client.search_notes(keyword, sort="time_descending")
+                    else:
+                        d = await client.notes_by_creator(user_id, xsec_token=xsec_token)
+                        briefs_raw = d.get("notes") or []
+                        try:
+                            author = await client.user_info(user_id)
+                        except Exception:
+                            author = None
+            if use_browser or (rmode == "hybrid" and not briefs_raw):
+                use_browser = True
+                if kind == "keyword":
+                    briefs_raw, browser_error = await fetch_rednote_search(
+                        self.browser, identity, keyword, known,
+                        max_scrolls=strategy["max_scrolls"],
+                        search_sort="latest",
+                        block_media=self.cfg.engine.block_media_resources,
+                        keep_context=True)
+                else:
+                    briefs_raw, author, browser_error = await fetch_rednote_notes(
+                        self.browser, identity, user_id, known,
+                        xsec_token=xsec_token, xsec_source="pc_feed",
+                        max_scrolls=strategy["max_scrolls"],
+                        block_media=self.cfg.engine.block_media_resources,
+                        ssr_fallback=True,
+                        keep_context=True)
+                if browser_error:
+                    error = browser_error
+        except RednoteApiError as e:
+            if rmode == "hybrid" and e.category != "auth":
+                use_browser = True
+                if kind == "keyword":
+                    briefs_raw, browser_error = await fetch_rednote_search(
+                        self.browser, identity, keyword, known,
+                        max_scrolls=strategy["max_scrolls"],
+                        search_sort="latest",
+                        block_media=self.cfg.engine.block_media_resources,
+                        keep_context=True)
+                else:
+                    briefs_raw, author, browser_error = await fetch_rednote_notes(
+                        self.browser, identity, user_id, known,
+                        xsec_token=xsec_token, xsec_source="pc_feed",
+                        max_scrolls=strategy["max_scrolls"],
+                        block_media=self.cfg.engine.block_media_resources,
+                        ssr_fallback=True,
+                        keep_context=True)
+                if browser_error:
+                    error = browser_error
+            else:
+                error = e
+        except Exception as e:
+            category, _signal = classify_platform_error(e)
+            error = (e if category in {
+                RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK
+            } else f"海外小红书请求失败: {e!r}")
+
+        new_records = []
+        seen = set()
+        detail_attempts = 0
+        filtered_count = 0
+        detail_failures = 0
+        consecutive_detail_failures = 0
+        first_detail_error = None
+        access_updates = {}
+        default_note_source = "pc_search" if kind == "keyword" else ("pc_feed" if use_browser else "pc_user")
+        next_long_pause = random.randint(3, 5)
+        for raw in briefs_raw:
+            if error and classify_platform_error(error)[0] in {
+                    RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                break
+            brief = parse_rednote_brief(raw)
+            if not brief or brief["note_id"] in seen:
+                continue
+            if brief["note_id"] in known:
+                previous = failed_access.get(brief["note_id"])
+                token = brief.get("xsec_token") or ""
+                source = brief.get("xsec_source") or default_note_source
+                if previous and token and (token, source) != previous[1:]:
+                    access_updates[previous[0]] = (token, source)
+                continue
+            seen.add(brief["note_id"])
+            if detail_budget and detail_attempts >= detail_budget:
+                break
+            detail_attempts += 1
+            if len(seen) > 1:
+                if detail_attempts >= next_long_pause:
+                    await self._xhs_gap(random.uniform(6.0, 11.0))
+                    next_long_pause += random.randint(3, 6)
+                else:
+                    await self._xhs_gap()
+            note_tok = brief.get("xsec_token", "")
+            note_source = brief.get("xsec_source") or default_note_source
+            derr = ""
+            card = {}
+            try:
+                if rmode in {"api", "hybrid"} and client is not None:
+                    try:
+                        async with client.session_scope():
+                            card = await client.note_detail(
+                                brief["note_id"], xsec_token=note_tok,
+                                xsec_source=note_source)
+                    except RednoteApiError as api_det_err:
+                        if rmode == "api" or api_det_err.category == "auth":
+                            raise
+                        if api_det_err.category == "business" and (
+                            api_det_err.code == -510000
+                            or api_det_err.signal in {"note_unavailable", "api_code_-510000"}
+                        ):
+                            raise
+                        card = {}
+                if not card and rmode in {"browser", "hybrid"}:
+                    card, derr = await fetch_rednote_note_detail(
+                        self.browser, identity, brief["note_id"],
+                        xsec_token=note_tok,
+                        xsec_source=note_source,
+                        block_media=self.cfg.engine.block_media_resources,
+                        keep_context=True)
+                    card = card or {}
+                    if derr and classify_platform_error(derr)[0] in {
+                            RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                        error = derr
+                        break
+            except RednoteApiError as e:
+                if e.category != "business" or not (
+                        e.code == -510000 or e.signal in {"note_unavailable", "api_code_-510000"}):
+                    error = e
+                    break
+                derr = str(e)
+                first_detail_error = first_detail_error or e
+            except Exception as e:
+                category, _signal = classify_platform_error(e)
+                if category in {RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                    error = e
+                    break
+                derr = str(e)
+            aw = parse_rednote_detail(card or {}, brief) if card else None
+            if not aw:
+                detail_failures += 1
+                consecutive_detail_failures += 1
+                first_detail_error = first_detail_error or RednoteApiError(
+                    derr or "海外小红书笔记详情未取到媒体直链", signal="note_detail_unavailable")
+                aw = Aweme(aweme_id=brief["note_id"], desc=brief.get("title", ""),
+                           create_time=int(brief.get("create_time") or 0), author_name="",
+                           media_type="video" if brief.get("type") == "video" else "images")
+                aw.platform = "rednote"
+                aw.cover = brief.get("cover", "")
+            else:
+                consecutive_detail_failures = 0
+            if aw.medias and not _monitor_content_matches(aw, strategy):
+                filtered_count += 1
+                continue
+            should_download = bool(aw.medias) and auto_download and (
+                media_filter == "all" or aw.media_type == media_filter)
+            media_json = json.dumps([
+                {
+                    "url": m.url,
+                    "kind": m.kind,
+                    "ext": m.ext,
+                    "index": m.index,
+                    **({"backup_urls": m.backup_urls} if getattr(m, "backup_urls", None) else {}),
+                }
+                for m in aw.medias
+            ]) if aw.medias else ""
+            rec = ContentRecord(
+                platform="rednote", target_id=target_id, aweme_id=aw.aweme_id, desc=aw.desc,
+                media_type=aw.media_type, quality=aw.quality_label,
+                create_time=aw.create_time, cover_url=aw.cover or "",
+                like_count=aw.like_count, comment_count=aw.comment_count,
+                duration=aw.duration, media_json=media_json, xsec_token=note_tok,
+                xsec_source=note_source,
+                download_status=("pending" if should_download
+                                 else ("skipped" if aw.medias else "failed")),
+                error="" if aw.medias else (derr or "未取到媒体直链"),
+            )
+            new_records.append((rec, aw, should_download))
+            if consecutive_detail_failures >= 3:
+                error = RednoteApiError(
+                    f"连续 3 条海外小红书笔记详情未返回，已停止本轮请求。{first_detail_error}",
+                    signal="note_detail_batch_unavailable")
+                break
+
+        if not error and first_detail_error:
+            error = first_detail_error
+
+        target_name = ""
+        refreshed_access = 0
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            for record_id, (token, source) in access_updates.items():
+                rec = s.get(ContentRecord, record_id)
+                if rec and rec.download_status == "failed" and not _loads(rec.media_json):
+                    rec.xsec_token, rec.xsec_source = token, source
+                    s.add(rec)
+                    refreshed_access += 1
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = str(error or "")
+                if author:
+                    p = parse_rednote_self_user(author)
+                    if not t.nickname:
+                        t.nickname = p.get("nickname") or t.nickname
+                    if not t.avatar:
+                        t.avatar = p.get("avatar") or t.avatar
+                s.add(t)
+                target_name = t.nickname or (("#" + keyword) if kind == "keyword"
+                                             else (user_id[:12] if user_id else "rednote"))
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        captured = [aw for _, aw, _ in new_records if aw.medias]
+        if captured and not first_scan:
+            await self._notify_new(target_name, captured)
+
+        await asyncio.gather(*(self._download(
+            rec.id, aw, base_dir, proxy, referer="https://www.rednote.com/"
+        ) for rec, aw, should_download in new_records if should_download))
         return {"ok": not error, "new": len(new_records), "error": error,
                 "scanned": detail_attempts, "filtered": filtered_count,
                 "captured": len(captured), "failed": detail_failures,
@@ -2998,9 +3668,17 @@ class MonitorEngine:
                         self.cfg, "douyin", "creator_danmaku", acc)["effective_mode"]
                         if mode == "creator" else self.cfg.engine.douyin_read_mode)
                     if account_mode != "api":
-                        identity = self.browser.identity_for(acc)
+                        identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
             if identity is None and not watch.account_id:
-                identity = self.browser.anon_identity()
+                identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
 
         if mode == "creator" and watch.account_id:
             creator_transport = resolve_transport(
@@ -3460,7 +4138,7 @@ class MonitorEngine:
     async def sync_work_comments(self, account_id: int, platform: str, item_id: str,
                                  xsec_token: str = "") -> dict:
         """抓「本账号某作品」的评论并落库(watch_id=0 标记本账号来源)。
-        抖音直连(comment/list 分页 + 回复,参考 CommentAll),小红书走签名直连客户端,
+        抖音直连(comment/list 分页 + 回复),小红书走签名直连客户端,
         快手走浏览器拦截。返回 {ok, fetched, added, error}。"""
         key = f"wc:{account_id}:{item_id}"
         if key in self._inflight:
@@ -3687,11 +4365,98 @@ class MonitorEngine:
                     if cid and cid not in known and cid not in dedup:
                         dedup[cid] = c
                 fresh = list(dedup.values())
+            elif platform == "rednote":
+                configured_mode = self._rednote_read_mode()
+                rcli = (
+                    self._rednote_client(identity, state, proxy)
+                    if configured_mode in {"api", "hybrid"}
+                    else None
+                )
+                if configured_mode == "api" and rcli is None:
+                    return {
+                        "ok": False, "fetched": 0, "added": 0,
+                        "error": "海外小红书账号缺 a1 Cookie,无法直连抓评论",
+                        "source": "api", "configured_mode": configured_mode,
+                    }
+                if rcli is not None and configured_mode in {"api", "hybrid"}:
+                    try:
+                        async with rcli.session_scope():
+                            fresh = await self._rednote_fetch_comments(
+                                rcli, item_id, xsec_token, known
+                            )
+                        source = "api"
+                    except Exception as exc:
+                        if configured_mode == "api":
+                            raise
+                        error = str(exc)
+                if configured_mode == "browser" or (configured_mode == "hybrid" and not fresh and (rcli is None or error)):
+                    raw, b_err = await fetch_rednote_comments(
+                        self.browser, identity, item_id, known,
+                        xsec_token=xsec_token, xsec_source="pc_feed",
+                        max_scrolls=self.cfg.engine.comment_max_scrolls,
+                        block_media=self.cfg.engine.block_media_resources,
+                    )
+                    source = "browser_fallback" if (configured_mode == "hybrid" and rcli is not None) else "browser"
+                    error = b_err or ""
+                    fresh = [
+                        c for c in (parse_rednote_comment(rc) for rc in flatten_rednote_comments(raw))
+                        if c and c["comment_id"] not in known
+                    ]
+            elif platform == "instagram":
+                configured_mode = str(
+                    getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid"
+                ).lower()
+                icli = InstagramClient(
+                    state,
+                    ua,
+                    proxy=proxy,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    account_seed=(
+                        (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                        if identity is not None
+                        else ""
+                    ),
+                    timezone_id=(
+                        getattr(identity, "timezone_id", "Asia/Shanghai")
+                        if identity is not None
+                        else "Asia/Shanghai"
+                    ),
+                )
+                collected_ig: list[dict] = []
+                api_err = ""
+                if configured_mode in {"api", "hybrid"}:
+                    async with icli.session_scope():
+                        collected_ig, api_err = await icli.fetch_comments(
+                            item_id, max_count=200, include_replies=True
+                        )
+                    if not api_err or collected_ig:
+                        source = "api"
+                auth_failed = classify_platform_error(api_err)[0] == RiskCategory.AUTH
+                if configured_mode == "browser" or (
+                    configured_mode == "hybrid" and not collected_ig and api_err and not auth_failed and identity is not None
+                ):
+                    ig_rows, ig_err = await fetch_ig_comments(
+                        self.browser, identity, item_id, max_count=200
+                    )
+                    source = "browser_fallback" if configured_mode == "hybrid" else "browser"
+                    if ig_rows:
+                        collected_ig = ig_rows
+                        error = ""
+                    else:
+                        error = ig_err or api_err
+                else:
+                    error = api_err
+                dedup_ig: dict[str, dict] = {}
+                for c in collected_ig:
+                    cid = c.get("comment_id")
+                    if cid and cid not in known and cid not in dedup_ig:
+                        dedup_ig[cid] = c
+                fresh = list(dedup_ig.values())
             else:
                 return {"ok": False, "fetched": 0, "added": 0,
                         "error": f"不支持的平台:{platform}",
                         "source": "unavailable", "configured_mode": "unavailable"}
-        except XhsApiError as e:
+        except (XhsApiError, RednoteApiError) as e:
             error = e
         except Exception as e:
             log.warning("本账号作品评论抓取失败 %s/%s: %s", platform, item_id, e)
@@ -3811,7 +4576,11 @@ class MonitorEngine:
             name = w.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
             state = creator_state = proxy = ""
             ua = self.cfg.engine.user_agent
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             has_creator = False
             if w.account_id:
                 acc = s.get(DouyinAccount, w.account_id)
@@ -3844,7 +4613,11 @@ class MonitorEngine:
                     ua = acc.ua or self.cfg.engine.user_agent
                     proxy = acc.proxy or ""
                     has_creator = bool(creator_state)
-                    identity = self.browser.identity_for(acc)
+                    identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
                 elif platform == "tiktok":
                     msg = "绑定的 TikTok 账号不存在或登录态已失效"
                     w.last_scan_at = datetime.utcnow()
@@ -3857,6 +4630,14 @@ class MonitorEngine:
                 w.last_error = msg
                 s.add(w); s.commit()
                 return {"ok": False, "new_comments": 0, "error": msg}
+            if platform == "instagram":
+                acc_ig = s.get(DouyinAccount, w.account_id) if w.account_id else None
+                if not w.account_id or not acc_ig or acc_ig.platform != "instagram" or acc_ig.status != "active" or not state:
+                    msg = "Instagram 评论监控必须绑定已登录且状态正常的 Instagram 账号"
+                    w.last_scan_at = datetime.utcnow()
+                    w.last_error = msg
+                    s.add(w); s.commit()
+                    return {"ok": False, "new_comments": 0, "error": msg}
 
         # 公开抖音读取可复用一个带 Cookie 的 Web API 会话；创作中心仍由
         # 浏览器处理。没有登录态时 hybrid 继续允许匿名浏览器回退。
@@ -3883,6 +4664,15 @@ class MonitorEngine:
                     w.last_error = msg
                     s.add(w); s.commit()
             return {"ok": False, "new_comments": 0, "error": msg}
+        if platform == "rednote" and not state:
+            msg = "海外小红书评论监控需要绑定一个已登录的海外小红书账号(笔记页需登录)"
+            with get_session() as s:
+                w = s.get(CommentWatch, watch_id)
+                if w:
+                    w.last_scan_at = datetime.utcnow()
+                    w.last_error = msg
+                    s.add(w); s.commit()
+            return {"ok": False, "new_comments": 0, "error": msg}
         try:
             if platform == "xhs" and kind == "user":
                 total_new, author = await self._cw_xhs_creator(
@@ -3890,6 +4680,14 @@ class MonitorEngine:
                     xsec_token, name, first_scan, proxy)
             elif platform == "xhs":   # 单条笔记
                 total_new, author = await self._cw_xhs_note(
+                    watch_id, identity, state, aweme_id,
+                    xsec_token, name, first_scan, proxy)
+            elif platform == "rednote" and kind == "user":
+                total_new, author = await self._cw_rednote_creator(
+                    watch_id, identity, state, sec_uid,
+                    xsec_token, name, first_scan, proxy)
+            elif platform == "rednote":
+                total_new, author = await self._cw_rednote_note(
                     watch_id, identity, state, aweme_id,
                     xsec_token, name, first_scan, proxy)
             elif platform == "kuaishou" and kind == "user":
@@ -3917,6 +4715,12 @@ class MonitorEngine:
             elif platform == "bilibili":
                 total_new, author = await self._cw_bilibili_video(
                     watch_id, identity, state, ua, proxy, aweme_id, name, first_scan)
+            elif platform == "instagram" and kind == "user":
+                total_new, author = await self._cw_instagram_user(
+                    watch_id, identity, state, ua, proxy, sec_uid, name, first_scan)
+            elif platform == "instagram":
+                total_new, author = await self._cw_instagram_video(
+                    watch_id, identity, state, ua, proxy, aweme_id, name, first_scan)
             elif kind == "user" and mode == "creator":
                 total_new, author = await self._cw_creator(watch_id, identity, has_creator,
                                                            name, first_scan)
@@ -3928,7 +4732,7 @@ class MonitorEngine:
                 total_new, author = await self._cw_video(
                     watch_id, identity, aweme_id, name, first_scan,
                     api_client=api_client)
-        except XhsApiError as e:
+        except (XhsApiError, RednoteApiError) as e:
             error = e
         except Exception as e:
             category, _signal = classify_platform_error(e)
@@ -3943,11 +4747,14 @@ class MonitorEngine:
                 w.last_scan_at = datetime.utcnow()
                 w.last_error = str(error or "")
                 if author:
-                    if not w.title:
+                    if (
+                        not w.title
+                        or (w.platform == "instagram" and w.title.startswith("IG "))
+                    ):
                         w.title = author.get("nickname") or w.title
-                    if not w.avatar:
-                        ava = (author.get("avatar_thumb") or {}).get("url_list") or []
-                        w.avatar = ava[0] if ava else w.avatar
+                    ava = (author.get("avatar_thumb") or {}).get("url_list") or []
+                    if ava and ava[0] and (not w.avatar or w.platform == "instagram"):
+                        w.avatar = ava[0]
                 w.comment_count = len(s.exec(select(CommentRecord.id)
                                              .where(CommentRecord.watch_id == watch_id)).all())
                 s.add(w); s.commit()
@@ -4506,6 +5313,183 @@ class MonitorEngine:
                         "avatar_thumb": {"url_list": [author_dict["avatar"]]}}
                        if author_dict else None)
 
+    def _rednote_read_mode(self) -> str:
+        mode = str(getattr(self.cfg.engine, "rednote_read_mode", "hybrid") or "hybrid").lower()
+        return mode if mode in {"browser", "hybrid", "api"} else "hybrid"
+
+    def _rednote_client(self, identity, state: str, proxy: str = "") -> Optional[RednoteApiClient]:
+        cookie_str = rednote_cookie_str_from_state(state)
+        if not rednote_has_a1(cookie_str):
+            return None
+        return RednoteApiClient(
+            cookie_str,
+            self._direct_request_ua(identity),
+            timeout=self.cfg.engine.request_timeout_seconds,
+            proxy=proxy,
+            storage_state=state,
+        )
+
+    async def _rednote_fetch_comments(self, client: RednoteApiClient, note_id, xsec_token, known) -> list:
+        try:
+            d = await client.note_comments(note_id, xsec_token=xsec_token)
+            raw = d.get("comments") or []
+        except RednoteApiError:
+            raise
+        except Exception as e:
+            category, _signal = classify_platform_error(e)
+            if category in {RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
+                raise
+            log.info("评论监控(海外小红书)%s: %s", note_id, e)
+            return []
+        fresh = [c for c in (parse_rednote_comment(rc) for rc in flatten_rednote_comments(raw)) if c]
+        return [c for c in fresh if c["comment_id"] not in known]
+
+    async def _cw_rednote_note(
+        self, watch_id, identity, state, note_id, xsec_token, name,
+        first_scan, proxy=""
+    ):
+        with get_session() as s:
+            known = set(s.exec(select(CommentRecord.comment_id)
+                               .where(CommentRecord.watch_id == watch_id)
+                               .where(CommentRecord.aweme_id == note_id)).all())
+        rmode = self._rednote_read_mode()
+        client = self._rednote_client(identity, state, proxy) if rmode in {"api", "hybrid"} else None
+        fresh: list = []
+        api_failed = False
+        work_desc = name
+        author_meta = None
+        if client is not None and rmode in {"api", "hybrid"}:
+            try:
+                async with client.session_scope():
+                    try:
+                        card = await client.note_detail(
+                            note_id, xsec_token=xsec_token, xsec_source="pc_feed"
+                        )
+                        aw_det = parse_rednote_detail(card or {}, {"note_id": note_id}) if card else None
+                        raw_title = (
+                            (aw_det.desc if aw_det and aw_det.desc else "")
+                            or str((card or {}).get("title") or (card or {}).get("display_title") or (card or {}).get("desc") or "").strip()
+                        )
+                        if raw_title:
+                            work_desc = raw_title[:60]
+                            with get_session() as s:
+                                w = s.get(CommentWatch, watch_id)
+                                if w and (not w.title or w.title == f"笔记 {note_id}"):
+                                    w.title = raw_title[:40]
+                                    s.add(w)
+                                    s.commit()
+                        u_obj = (card or {}).get("user") if isinstance((card or {}).get("user"), dict) else {}
+                        nick = (aw_det.author_name if aw_det else "") or str(u_obj.get("nickname") or "")
+                        ava = (aw_det.avatar if aw_det else "") or str(u_obj.get("avatar") or "")
+                        if nick or ava:
+                            author_meta = {
+                                "nickname": nick,
+                                "avatar_thumb": {"url_list": [ava] if ava else []},
+                            }
+                    except Exception:
+                        pass
+                    fresh = await self._rednote_fetch_comments(
+                        client, note_id, xsec_token, known)
+            except Exception as e:
+                if rmode == "api" or classify_platform_error(e)[0] == RiskCategory.AUTH:
+                    raise
+                api_failed = True
+        if rmode == "browser" or (rmode == "hybrid" and (client is None or api_failed)):
+            raw, error = await fetch_rednote_comments(
+                self.browser, identity, note_id, known,
+                xsec_token=xsec_token, xsec_source="pc_feed",
+                max_scrolls=self._comment_watch_settings(watch_id)["max_scrolls"],
+                block_media=self.cfg.engine.block_media_resources)
+            if error:
+                log.info("评论监控(海外小红书)%s: %s", note_id, error)
+                self._raise_severe_xhs_read_error(error)
+            fresh = [
+                c for c in (parse_rednote_comment(rc) for rc in flatten_rednote_comments(raw))
+                if c and c["comment_id"] not in known
+            ]
+        n = await self._ingest(watch_id, note_id, fresh, name, work_desc, first_scan,
+                               platform="rednote")
+        return n, author_meta
+
+    async def _cw_rednote_creator(
+        self, watch_id, identity, state, user_id, xsec_token, name,
+        first_scan, proxy=""
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        rmode = self._rednote_read_mode()
+        client = self._rednote_client(identity, state, proxy) if rmode in {"api", "hybrid"} else None
+        use_browser = rmode == "browser" or client is None
+        briefs_raw: list = []
+        author = None
+        if not use_browser and client is not None:
+            try:
+                async with client.session_scope():
+                    d = await client.notes_by_creator(user_id, xsec_token=xsec_token)
+                    briefs_raw = d.get("notes") or []
+                    author = await client.user_info(user_id)
+            except RednoteApiError as e:
+                if rmode == "api" or e.category == "auth":
+                    raise
+                use_browser = True
+            except Exception as e:
+                if rmode == "api" or classify_platform_error(e)[0] in {
+                        RiskCategory.AUTH, RiskCategory.NETWORK}:
+                    raise
+                use_browser = True
+        if use_browser:
+            briefs_raw, author, error = await fetch_rednote_notes(
+                self.browser, identity, user_id, set(),
+                xsec_token=xsec_token, xsec_source="pc_feed",
+                max_scrolls=4,
+                block_media=self.cfg.engine.block_media_resources)
+            if error:
+                log.info("评论监控(海外小红书创作者)%s: %s", user_id, error)
+                self._raise_severe_xhs_read_error(error)
+        briefs = [b for b in (parse_rednote_brief(r) for r in briefs_raw) if b]
+        cutoff = int(time.time()) - settings["recent_days"] * 86400
+        briefs = [b for b in briefs if not b.get("create_time") or b["create_time"] >= cutoff]
+        briefs = briefs[:settings["recent_works"]]
+        total = 0
+        for index, b in enumerate(briefs):
+            nid = b["note_id"]
+            with get_session() as s:
+                known = set(s.exec(select(CommentRecord.comment_id)
+                                   .where(CommentRecord.watch_id == watch_id)
+                                   .where(CommentRecord.aweme_id == nid)).all())
+            if index:
+                await self._xhs_gap()
+            need_browser_comments = use_browser or client is None
+            fresh = []
+            if not need_browser_comments:
+                try:
+                    async with client.session_scope():
+                        fresh = await self._rednote_fetch_comments(
+                            client, nid, b.get("xsec_token", ""), known)
+                except Exception as e:
+                    if rmode == "api" or classify_platform_error(e)[0] == RiskCategory.AUTH:
+                        raise
+                    need_browser_comments = True
+            if need_browser_comments:
+                raw, read_error = await fetch_rednote_comments(
+                    self.browser, identity, nid, known,
+                    xsec_token=b.get("xsec_token", ""),
+                    xsec_source="pc_feed",
+                    max_scrolls=settings["max_scrolls"],
+                    block_media=self.cfg.engine.block_media_resources)
+                if read_error:
+                    log.info("评论监控(海外小红书)%s: %s", nid, read_error)
+                    self._raise_severe_xhs_read_error(read_error)
+                fresh = [
+                    c for c in (parse_rednote_comment(rc) for rc in flatten_rednote_comments(raw))
+                    if c and c["comment_id"] not in known
+                ]
+            total += await self._ingest(watch_id, nid, fresh, name, b.get("title", ""),
+                                        first_scan, platform="rednote")
+        author_dict = parse_rednote_self_user(author) if author else None
+        return total, ({"nickname": author_dict["nickname"],
+                        "avatar_thumb": {"url_list": [author_dict["avatar"]]}}
+                       if author_dict else None)
+
     async def _cw_bilibili_video(
         self, watch_id: int, identity, state: str, ua: str, proxy: str,
         work_id: str, name: str, first_scan: bool
@@ -4596,6 +5580,168 @@ class MonitorEngine:
                 )
         return total, author_dict
 
+    async def _cw_instagram_video(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        work_id: str, name: str, first_scan: bool, work_desc: str = ""
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        with get_session() as s:
+            known = set(
+                s.exec(
+                    select(CommentRecord.comment_id)
+                    .where(CommentRecord.watch_id == watch_id)
+                    .where(CommentRecord.aweme_id == work_id)
+                ).all()
+            )
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        max_c = max(30, int(settings["max_scrolls"] or 4) * 20)
+        rows: list[dict] = []
+        err = ""
+        author_dict = None
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=(
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else ""
+            ),
+            timezone_id=(
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else "Asia/Shanghai"
+            ),
+        )
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                aw_info, _raw_m, _ = await icli.fetch_media_info(work_id)
+                if aw_info is not None and (aw_info.author_name or aw_info.desc):
+                    clean_desc = " ".join(str(aw_info.desc or "").split())[:36]
+                    if aw_info.author_name and clean_desc:
+                        display_title = f"{aw_info.author_name} · {clean_desc}"
+                    else:
+                        display_title = clean_desc or aw_info.author_name
+                    if not work_desc and aw_info.desc:
+                        work_desc = aw_info.desc[:80]
+                    author_dict = {
+                        "nickname": display_title,
+                        "avatar_thumb": {"url_list": [str(aw_info.avatar or aw_info.cover or "")]},
+                    }
+                rows, err = await icli.fetch_comments(work_id, max_count=max_c, include_replies=True)
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not rows and err and not auth_failed)
+            ) and identity is not None:
+                ig_rows, ig_err = await fetch_ig_comments(
+                    self.browser, identity, work_id, max_count=max_c
+                )
+                if ig_rows:
+                    rows, err = ig_rows, ""
+                elif mode == "browser":
+                    err = ig_err
+        if err and not rows:
+            raise RuntimeError(err)
+        fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+        total = await self._ingest(
+            watch_id, work_id, fresh, name, work_desc or name, first_scan, platform="instagram"
+        )
+        return total, author_dict
+
+    async def _cw_instagram_user(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        user_ref: str, name: str, first_scan: bool
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=(
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else ""
+            ),
+            timezone_id=(
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else "Asia/Shanghai"
+            ),
+        )
+        total = 0
+        author_dict = None
+        raw_feed: list[dict] = []
+        err = ""
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                raw_feed, _next, _more, err = await icli.fetch_user_feed(user_ref)
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not raw_feed and err and not auth_failed)
+            ) and identity is not None:
+                b_items, b_author, b_err = await fetch_ig_posts(
+                    self.browser, identity, user_ref, set(), max_scrolls=3
+                )
+                if b_items:
+                    raw_feed, err = b_items, ""
+                    if isinstance(b_author, dict) and b_author.get("nickname"):
+                        author_dict = {
+                            "nickname": str(b_author["nickname"]),
+                            "avatar_thumb": {"url_list": [str(b_author.get("avatar") or "")]},
+                        }
+                elif mode == "browser":
+                    err = b_err
+            if err and not raw_feed:
+                raise RuntimeError(err)
+            cutoff = int(time.time()) - settings["recent_days"] * 86400
+            selected: list[tuple[str, str]] = []
+            for raw in raw_feed:
+                aw = parse_ig_aweme(raw, require_media=False)
+                if aw is None:
+                    continue
+                if not author_dict and aw.author_name:
+                    author_dict = {
+                        "nickname": str(aw.author_name),
+                        "avatar_thumb": {"url_list": [str(aw.avatar or "")]},
+                    }
+                if not cutoff or not aw.create_time or aw.create_time >= cutoff:
+                    selected.append((aw.aweme_id, aw.desc))
+                if len(selected) >= settings["recent_works"]:
+                    break
+            max_c = max(20, int(settings["max_scrolls"] or 4) * 20)
+            for code, desc in selected:
+                with get_session() as s:
+                    known = set(
+                        s.exec(
+                            select(CommentRecord.comment_id)
+                            .where(CommentRecord.watch_id == watch_id)
+                            .where(CommentRecord.aweme_id == code)
+                        ).all()
+                    )
+                rows: list[dict] = []
+                c_err = ""
+                if mode in {"api", "hybrid"}:
+                    rows, c_err = await icli.fetch_comments(code, max_count=max_c, include_replies=True)
+                if (
+                    mode == "browser"
+                    or (mode == "hybrid" and not rows and c_err)
+                ) and identity is not None:
+                    b_rows, _ = await fetch_ig_comments(
+                        self.browser, identity, code, max_count=max_c
+                    )
+                    if b_rows:
+                        rows = b_rows
+                fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+                total += await self._ingest(
+                    watch_id, code, fresh, name, desc, first_scan, platform="instagram"
+                )
+        return total, author_dict
+
     # ── 发布(小红书创作平台)+ 跨平台转发 ──
     def _content_files(self, rec: ContentRecord) -> list:
         """收集一条作品记录在本地的媒体文件路径。"""
@@ -4649,12 +5795,18 @@ class MonitorEngine:
                 files = [files[i] for i in media_order]
             if target_platform == "tiktok" and rec.media_type != "video":
                 raise ValueError("TikTok 网页发布当前仅支持视频")
-            if target_platform == "xhs":
+            if target_platform == "instagram" and len(files) > 10:
+                raise ValueError("Instagram 轮播发布最多支持 10 个媒体文件")
+            if target_platform in {"xhs", "rednote"}:
                 from ..platforms.xhs.media import validate_publish_files
                 files = validate_publish_files(
                     "video" if rec.media_type == "video" else "images", files)
-            title_cap = {"douyin": 30, "shipinhao": 16, "bilibili": 80}.get(target_platform, 20)
-            t_title = (title if title is not None else (rec.desc or ""))[:title_cap]
+            raw_title = title if title is not None else (rec.desc or "")
+            if target_platform == "rednote":
+                t_title = weighted_truncate(raw_title.strip(), 20)
+            else:
+                title_cap = {"douyin": 30, "shipinhao": 16, "bilibili": 80, "instagram": 2200}.get(target_platform, 20)
+                t_title = raw_title[:title_cap]
             t_desc = desc if desc is not None else (rec.desc or "")
             t_topics = topics if topics is not None else ""
             task = PublishTask(
@@ -4738,10 +5890,26 @@ class MonitorEngine:
             dy_publish_transport = (resolve_transport(
                 self.cfg, "douyin", "publish", acc)
                 if platform == "douyin" else None)
-            api_only = bool(dy_publish_transport and
-                            dy_publish_transport["configured_mode"] == "api")
-            environment_error = self._native_write_environment_error(
-                acc, headed=not api_only, browser_mode=not api_only)
+            ig_publish_transport = (resolve_transport(
+                self.cfg, "instagram", "publish", acc)
+                if platform == "instagram" else None)
+            rn_api_publish = (
+                platform == "rednote" and self._rednote_publish_mode() == "api"
+            )
+            api_only = bool(
+                (dy_publish_transport and dy_publish_transport["configured_mode"] == "api")
+                or (ig_publish_transport and ig_publish_transport["effective_mode"] == "api")
+                or rn_api_publish
+            )
+            skip_env_check = (
+                (api_only and not rn_api_publish)
+                or bool(ig_publish_transport and ig_publish_transport["configured_mode"] == "hybrid")
+            )
+            environment_error = (
+                "" if skip_env_check else self._native_write_environment_error(
+                    acc, headed=not api_only, browser_mode=not api_only
+                )
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -4768,13 +5936,16 @@ class MonitorEngine:
             native_mode = acc.identity_mode == "native"
             identity = (None if dy_publish_transport and
                         dy_publish_transport["effective_mode"] == "unavailable"
-                        else self.browser.identity_for(acc))
+                        else (self.browser.identity_for(acc)
+                              if callable(getattr(self.browser, "identity_for", None))
+                              else None))
             media_type, title, desc, topics = t.media_type, t.title, t.desc, t.topics
             visibility, allow_save = t.visibility, t.allow_save
             allow_comment = getattr(t, "allow_comment", True)
             allow_duet = getattr(t, "allow_duet", True)
             allow_stitch = getattr(t, "allow_stitch", True)
             bili_options = _loads(getattr(t, "bili_options_json", "{}") or "{}")
+            ig_options = _loads(getattr(t, "ig_options_json", "{}") or "{}")
             location = getattr(t, "location", "") or ""
             platform = t.platform
             files = _loads_list(t.media_json)
@@ -4850,6 +6021,38 @@ class MonitorEngine:
                 allow_comment=allow_comment, bili_options=bili_options,
                 headed=True)
 
+        if platform == "rednote":
+            if not state:
+                return await self._finish_publish(
+                    task_id, False, "", "该账号未完成海外小红书登录，请先在账号页扫码或创作者登录",
+                    platform="rednote")
+            rn_mode = self._rednote_publish_mode()
+            return await self._run_browser_publish(
+                task_id, "rednote", publish_rednote,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, headed=(rn_mode != "api"), mode=rn_mode,
+                visibility=visibility,
+                preserve_error=True, channel=rn_mode,
+                cancel_message="write_uncertain:海外小红书发布已中断，结果需到平台核对")
+
+        if platform == "instagram":
+            if not state:
+                return await self._finish_publish(
+                    task_id, False, "", "该账号未完成 Instagram 登录，请先在账号页登录或导入 Cookie",
+                    platform="instagram")
+            ig_write_mode = str(
+                getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid"
+            ).strip().lower()
+            if ig_write_mode not in {"hybrid", "api", "browser"}:
+                ig_write_mode = "hybrid"
+            ig_channel = "api" if ig_write_mode in {"api", "hybrid"} else "browser"
+            return await self._run_browser_publish(
+                task_id, "instagram", publish_instagram,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, visibility=visibility,
+                allow_comment=allow_comment, ig_options=ig_options,
+                mode=ig_write_mode, headed=True, channel=ig_channel)
+
         if not state:
             return await self._finish_publish(
                 task_id, False, "", "该账号未完成小红书「创作者登录」,请先在账号页点「创作者登录」",
@@ -4885,7 +6088,7 @@ class MonitorEngine:
         """Execute one platform publisher with uniform submit-boundary & cancel protection."""
         pname = {"kuaishou": "快手", "douyin": "抖音",
                  "shipinhao": "视频号", "tiktok": "TikTok",
-                 "bilibili": "哔哩哔哩",
+                 "bilibili": "哔哩哔哩", "rednote": "海外小红书", "instagram": "Instagram",
                  "xhs": "小红书"}.get(platform, platform)
         call_kwargs = dict(kwargs)
         try:
@@ -4896,11 +6099,15 @@ class MonitorEngine:
                 call_kwargs["on_stage"] = lambda msg: self._set_publish_stage(task_id, msg)
         except Exception:
             pass
+        default_channel = "api" if channel in {"api", "hybrid"} else "browser"
         try:
             ok, url, err = await publish_fn(
                 *args,
-                on_submit=(lambda: self._mark_write_submit(
-                    PublishTask, task_id, channel=channel)),
+                on_submit=(lambda ch=default_channel: self._mark_write_submit(
+                    PublishTask,
+                    task_id,
+                    channel=(ch if ch in {"api", "browser"} else default_channel),
+                )),
                 **call_kwargs,
             )
         except asyncio.CancelledError:
@@ -4968,7 +6175,7 @@ class MonitorEngine:
                 if channels:
                     pname = {"kuaishou": "快手", "douyin": "抖音",
                              "shipinhao": "视频号", "tiktok": "TikTok",
-                             "bilibili": "哔哩哔哩"}.get(
+                             "bilibili": "哔哩哔哩", "rednote": "海外小红书", "instagram": "Instagram"}.get(
                                  platform, "小红书")
                     await notify_all(channels, f"{pname}发布成功", url or "已发布一条作品")
             except Exception:
@@ -5524,6 +6731,137 @@ class MonitorEngine:
                         "source_text": c.get("text", ""),
                     })
                 return cands, up_err
+        # ── Instagram: Mobile/Web API 搜索/时间线 + stream_comments 直连 + 浏览器回退 ──
+        if platform == "instagram":
+            imode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+            icli = InstagramClient(
+                state,
+                getattr(identity, "ua", "") or self.cfg.engine.user_agent,
+                proxy=proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+                account_seed=(
+                    (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                    if identity is not None
+                    else ""
+                ),
+                timezone_id=(
+                    getattr(identity, "timezone_id", "Asia/Shanghai")
+                    if identity is not None
+                    else "Asia/Shanghai"
+                ),
+            )
+            async with icli.session_scope():
+                if mode == "auto_comment":
+                    rows: list[dict] = []
+                    err = ""
+                    if imode in {"api", "hybrid"}:
+                        if kind == "keyword":
+                            rows, err = await icli.search_posts(rf["keyword"], max_pages=2)
+                        else:
+                            rows, _next, _more, err = await icli.fetch_user_feed(rf["sec_uid"])
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not rows and err)
+                    ) and identity is not None:
+                        if kind == "keyword":
+                            b_rows, b_err = await fetch_ig_search(
+                                self.browser, identity, rf["keyword"], max_scrolls=2
+                            )
+                        else:
+                            b_rows, _a, b_err = await fetch_ig_posts(
+                                self.browser, identity, rf["sec_uid"], set(), max_scrolls=2
+                            )
+                        if b_rows:
+                            rows, err = b_rows, ""
+                        elif imode == "browser":
+                            err = b_err
+                    for r in rows[: self.cfg.engine.comment_recent_works]:
+                        aw = parse_ig_aweme(r, require_media=False)
+                        if aw:
+                            cands.append({
+                                "aweme_id": aw.aweme_id,
+                                "xsec_token": "",
+                                "target_comment_id": "",
+                                "target_nick": "",
+                                "ctx": {"kw": rf["keyword"]} if kind == "keyword" else {},
+                                "source_text": aw.desc,
+                            })
+                    return cands, err
+
+                # auto_reply: 回复自己帖子/Reels 收到的评论
+                self_uid_str = str(icli.self_uid or acc_sec_uid or "")
+                works_to_check: list[str] = []
+                err = ""
+                if rf["target_kind"] == "work" and rf["aweme_id"]:
+                    works_to_check = [rf["aweme_id"]]
+                else:
+                    target_self = acc_sec_uid or icli.self_uid
+                    feed_rows: list[dict] = []
+                    if imode in {"api", "hybrid"} and target_self:
+                        feed_rows, _next, _more, err = await icli.fetch_user_feed(target_self)
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not feed_rows and err)
+                    ) and identity is not None and target_self:
+                        b_rows, _a, b_err = await fetch_ig_posts(
+                            self.browser, identity, target_self, set(), max_scrolls=2
+                        )
+                        if b_rows:
+                            feed_rows, err = b_rows, ""
+                        elif imode == "browser":
+                            err = b_err
+                    cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                    for r in feed_rows:
+                        aw = parse_ig_aweme(r, require_media=False)
+                        if aw and (not cutoff or not aw.create_time or aw.create_time >= cutoff):
+                            works_to_check.append(aw.aweme_id)
+                        if len(works_to_check) >= self.cfg.engine.comment_recent_works:
+                            break
+
+                comment_cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                for work_code in works_to_check:
+                    c_rows: list[dict] = []
+                    c_err = ""
+                    if imode in {"api", "hybrid"}:
+                        c_rows, c_err = await icli.fetch_comments(
+                            work_code, max_count=40, include_replies=True
+                        )
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not c_rows and c_err)
+                    ) and identity is not None:
+                        b_c_rows, b_c_err = await fetch_ig_comments(
+                            self.browser, identity, work_code, max_count=40
+                        )
+                        if b_c_rows:
+                            c_rows, c_err = b_c_rows, ""
+                        elif imode == "browser":
+                            c_err = b_c_err
+                    if c_err and not c_rows:
+                        err = err or c_err
+                        continue
+                    for c in c_rows:
+                        cid = str(c.get("comment_id") or "")
+                        if not cid:
+                            continue
+                        ct = int(c.get("create_time") or 0)
+                        if comment_cutoff and ct and ct < comment_cutoff:
+                            continue
+                        if (
+                            (self_uid_str and str(c.get("user_uid") or "") == self_uid_str)
+                            or (acc_sec_uid and str(c.get("user_sec_uid") or "") == acc_sec_uid)
+                            or (acc_nick and c.get("user_nickname") == acc_nick)
+                        ):
+                            continue
+                        cands.append({
+                            "aweme_id": work_code,
+                            "xsec_token": "",
+                            "target_comment_id": cid,
+                            "target_nick": c.get("user_nickname", ""),
+                            "ctx": {"nick": c.get("user_nickname", "")},
+                            "source_text": c.get("text", ""),
+                        })
+                return cands, ("" if cands else err)
         # ── 抖音:浏览器自动化(发现仍用拦截抓取)──
         if mode == "auto_comment":
             if kind == "keyword":
@@ -5747,13 +7085,20 @@ class MonitorEngine:
                 str(getattr(self.cfg.engine, "bilibili_write_mode", "hybrid") or "hybrid").lower()
                 if platform == "bilibili" else "browser"
             )
+            ig_write_mode = (
+                str(getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "instagram" else "browser"
+            )
             api_only = (
                 (platform == "douyin" and dy_write_mode == "api")
                 or (platform == "bilibili" and bili_write_mode in {"api", "hybrid"})
+                or (platform == "instagram" and ig_write_mode == "api")
             )
-            environment_error = ("" if api_only else
-                                 self._native_write_environment_error(
-                                     acc, headed=True, browser_mode=True))
+            environment_error = (
+                ""
+                if (api_only or (platform == "instagram" and ig_write_mode == "hybrid"))
+                else self._native_write_environment_error(acc, headed=True, browser_mode=True)
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -6054,6 +7399,68 @@ class MonitorEngine:
                         )
                     else:
                         ok, err = False, f"未知动作 {action}"
+            elif platform == "instagram" and ig_write_mode in {"api", "hybrid"}:
+                method = "api"
+                icli = InstagramClient(
+                    state,
+                    ua,
+                    proxy=proxy,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    account_seed=(
+                        (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                        if identity is not None
+                        else ""
+                    ),
+                    timezone_id=(
+                        getattr(identity, "timezone_id", "Asia/Shanghai")
+                        if identity is not None
+                        else "Asia/Shanghai"
+                    ),
+                )
+                async with icli.session_scope():
+                    if action == "follow":
+                        ok, err = await icli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=True,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "unfollow":
+                        ok, err = await icli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=False,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "send_dm":
+                        dm_target = dm_conv_id or target_uid or target_sec_uid
+                        ok, err, _meta = await icli.send_dm(
+                            dm_target,
+                            content,
+                            is_thread=bool(dm_conv_id and dm_target == dm_conv_id),
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    else:
+                        ok, err = False, f"未知动作 {action}"
+                if (
+                    not ok
+                    and ig_write_mode == "hybrid"
+                    and identity is not None
+                    and not str(err or "").startswith((
+                        "write_uncertain:",
+                        "target_resolution_failed:",
+                        "logged_out:",
+                        "verification_required:",
+                    ))
+                ):
+                    category, _signal = classify_platform_error(err)
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                        ok, err, method = await _browser_action()
+                        method = "browser_fallback" if method == "browser" else method
             elif platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
                 method = "api"
                 cookie = dy_cookie_from_state(state)
@@ -6245,13 +7652,24 @@ class MonitorEngine:
                 str(getattr(self.cfg.engine, "bilibili_write_mode", "hybrid") or "hybrid").lower()
                 if platform == "bilibili" else "browser"
             )
+            ig_write_mode = (
+                str(getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "instagram" else "browser"
+            )
             api_only = (
                 (platform == "douyin" and dy_write_mode == "api")
                 or (platform == "bilibili" and bili_write_mode == "api")
+                or (platform == "instagram" and ig_write_mode == "api")
             )
-            environment_error = ("" if (api_only or (platform == "bilibili" and bili_write_mode == "hybrid")) else
-                                 self._native_write_environment_error(
-                                     acc, headed=True, browser_mode=True))
+            environment_error = (
+                ""
+                if (
+                    api_only
+                    or (platform == "bilibili" and bili_write_mode == "hybrid")
+                    or (platform == "instagram" and ig_write_mode == "hybrid")
+                )
+                else self._native_write_environment_error(acc, headed=True, browser_mode=True)
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -6273,7 +7691,12 @@ class MonitorEngine:
             direct_environment = douyin_client_environment(acc)
             native_mode = acc.identity_mode == "native"
             # API-only 评论不启动账号浏览器；hybrid/browser 保留页面回退所需身份。
-            identity = None if api_only else self.browser.identity_for(acc)
+            identity = (
+                None if api_only
+                else (self.browser.identity_for(acc)
+                      if callable(getattr(self.browser, "identity_for", None))
+                      else None)
+            )
             t.status = "doing"; t.error = ""
             self._clear_row_block(t)
             s.add(t); s.commit()
@@ -6334,6 +7757,9 @@ class MonitorEngine:
                     require_reply=bool(target_cid),
                     on_submit=lambda: self._mark_write_submit(CommentTask, task_id),
                     headed=True, target_url=target_url)
+            elif platform == "rednote":
+                method = "unavailable"
+                err = "unavailable:海外小红书暂未开放评论写入与自动计划"
             elif platform == "bilibili":
                 if bili_write_mode in {"api", "hybrid"}:
                     method = "api"
@@ -6373,6 +7799,71 @@ class MonitorEngine:
                 else:
                     method = "browser"
                     ok, err = await post_bili_comment(
+                        self.browser,
+                        identity,
+                        aweme_id,
+                        content,
+                        on_submit=lambda: self._mark_write_submit(
+                            CommentTask, task_id, channel="browser"
+                        ),
+                    )
+                    result = "ok" if ok else ""
+            elif platform == "instagram":
+                if ig_write_mode in {"api", "hybrid"}:
+                    method = "api"
+                    icli = InstagramClient(
+                        state,
+                        ua,
+                        proxy=proxy,
+                        timeout=self.cfg.engine.request_timeout_seconds,
+                        account_seed=(
+                            (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                            if identity is not None
+                            else ""
+                        ),
+                        timezone_id=(
+                            getattr(identity, "timezone_id", "Asia/Shanghai")
+                            if identity is not None
+                            else "Asia/Shanghai"
+                        ),
+                    )
+                    async with icli.session_scope():
+                        ok, err, cmeta = await icli.post_comment(
+                            aweme_id,
+                            content,
+                            reply_to=target_cid,
+                            on_submit=lambda: self._mark_write_submit(
+                                CommentTask, task_id, channel="api"
+                            ),
+                        )
+                        result = str(cmeta.get("comment_id") or "ok") if ok else ""
+                    if (
+                        not ok
+                        and ig_write_mode == "hybrid"
+                        and identity is not None
+                        and not target_cid
+                        and not str(err or "").startswith((
+                            "write_uncertain:",
+                            "logged_out:",
+                            "verification_required:",
+                        ))
+                    ):
+                        category, _ = classify_platform_error(err)
+                        if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                            ok, err = await post_ig_comment(
+                                self.browser,
+                                identity,
+                                aweme_id,
+                                content,
+                                on_submit=lambda: self._mark_write_submit(
+                                    CommentTask, task_id, channel="browser"
+                                ),
+                            )
+                            method = "browser_fallback"
+                            result = "ok" if ok else ""
+                else:
+                    method = "browser"
+                    ok, err = await post_ig_comment(
                         self.browser,
                         identity,
                         aweme_id,
@@ -6624,14 +8115,62 @@ class MonitorEngine:
             if platform == "tiktok" and t and t.sec_uid:
                 aw.author_unique_id = t.sec_uid
                 aw.source_url = tiktok_video_url(aw.aweme_id, t.sec_uid)
-            needs_xhs_refetch = platform == "xhs" and (
+            needs_xhs_refetch = platform in {"xhs", "rednote"} and (
                 not media_json or not aw.medias)
             needs_bili_refetch = platform == "bilibili" and (
                 not media_json or not aw.medias)
+            needs_ig_refetch = platform == "instagram" and (
+                not media_json or not aw.medias)
             rec.download_status = "downloading"
-            if not needs_xhs_refetch and not needs_bili_refetch:
+            if not needs_xhs_refetch and not needs_bili_refetch and not needs_ig_refetch:
                 rec.retry_count = (rec.retry_count or 0) + 1
             s.add(rec); s.commit()
+
+        if platform == "instagram" and (not media_json or not aw.medias):
+            icli = InstagramClient(
+                acc_state,
+                (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+                account_seed=(
+                    (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                    if identity is not None
+                    else (acc.fp_seed or acc.profile_dir or "" if acc else "")
+                ),
+                timezone_id=(
+                    getattr(identity, "timezone_id", "Asia/Shanghai")
+                    if identity is not None
+                    else (acc.timezone_id or "Asia/Shanghai" if acc else "Asia/Shanghai")
+                ),
+            )
+            async with icli.session_scope():
+                aw2, _raw_m, ig_err = await icli.fetch_media_info(note_id)
+            if aw2 and aw2.medias:
+                aw = aw2
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                    }
+                    for m in aw.medias
+                ])
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.media_json = media_json
+                        s.add(rec); s.commit()
+            else:
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.download_status = "failed"
+                        rec.error = ig_err or "重拉 Instagram 作品详情仍无可用媒体直链"
+                        s.add(rec); s.commit()
+                return {"ok": False, "error": ig_err or "重拉 Instagram 作品详情仍无可用媒体直链"}
 
         if platform == "bilibili" and (not media_json or not aw.medias):
             bcli = BilibiliClient(
@@ -6674,8 +8213,75 @@ class MonitorEngine:
                         s.add(rec); s.commit()
                 return {"ok": False, "error": berr or "重拉 B 站稿件详情仍无可用直链"}
 
-        # 小红书:无媒体快照时,重新拉详情补齐媒体直链
-        if platform == "xhs" and (not media_json or not aw.medias):
+        # 小红书 / 海外小红书:无媒体快照时,重新拉详情补齐媒体直链
+        if platform == "rednote" and (not media_json or not aw.medias):
+            rmode = self._rednote_read_mode()
+            rcli = (
+                self._rednote_client(identity, acc_state, acc_proxy)
+                if rmode in {"api", "hybrid"}
+                else None
+            )
+            use_browser = rmode == "browser" or rcli is None
+            if not account_id:
+                derr = "监控目标未绑定海外小红书账号,请先编辑监控并选择账号"
+            else:
+                async def _refetch_rn_detail():
+                    try:
+                        if not use_browser and rcli is not None:
+                            try:
+                                async with rcli.session_scope():
+                                    detail = await rcli.note_detail(
+                                        note_id, xsec_token=note_tok,
+                                        xsec_source=note_source or ("pc_search" if kind == "keyword" else "pc_user"))
+                                if detail or rmode == "api":
+                                    return detail, ""
+                            except Exception as api_exc:
+                                if rmode == "api":
+                                    return {}, str(api_exc)
+                        if identity is None:
+                            return {}, "缺少浏览器身份"
+                        return await fetch_rednote_note_detail(
+                            self.browser, identity, note_id,
+                            xsec_token=note_tok,
+                            xsec_source=note_source or ("pc_search" if kind == "keyword" else "pc_feed"),
+                            block_media=self.cfg.engine.block_media_resources)
+                    except Exception as exc:
+                        return {}, str(exc)
+
+                card, derr = await self.guarded_read_pair(
+                    account_id, OperationKind.READ_HEAVY,
+                    f"retry-download:{record_id}", _refetch_rn_detail,
+                    empty_result={})
+                if not str(derr or "").startswith("risk_deferred:"):
+                    with get_session() as s:
+                        rec = s.get(ContentRecord, record_id)
+                        if rec:
+                            rec.retry_count = (rec.retry_count or 0) + 1
+                            s.add(rec); s.commit()
+            aw2 = parse_rednote_detail(card or {}, {"note_id": note_id}) if (account_id and card) else None
+            if aw2 and aw2.medias:
+                aw = aw2
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.media_type = aw.media_type
+                        rec.create_time = aw.create_time or rec.create_time
+                        rec.like_count = aw.like_count or rec.like_count
+                        rec.comment_count = aw.comment_count or rec.comment_count
+                        rec.cover_url = aw.cover or rec.cover_url
+                        rec.media_json = json.dumps([{"url": m.url, "kind": m.kind,
+                                                      "ext": m.ext, "index": m.index}
+                                                     for m in aw.medias])
+                        s.add(rec); s.commit()
+            else:
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.download_status = "failed"
+                        rec.error = derr or "重拉海外小红书详情仍无媒体(笔记可能已删/私密)"
+                        s.add(rec); s.commit()
+                return {"ok": False, "error": derr or "重拉海外小红书详情仍无媒体"}
+        elif platform == "xhs" and (not media_json or not aw.medias):
             browser_reads = bool(identity is not None and self._xhs_browser_reads_enabled())
             client = None if browser_reads else self._xhs_client(
                 identity, acc_state, acc_proxy)
@@ -6760,6 +8366,9 @@ class MonitorEngine:
             if acc_state:
                 download_cookies = bili_cookie_map(acc_state)
             download_referer = aw.source_url or f"https://www.bilibili.com/video/{note_id}"
+        elif platform == "instagram":
+            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_referer = "https://www.instagram.com/"
         ok, path, err = await self.downloader.download_aweme(
             aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
             cookies=download_cookies, referer=download_referer)
@@ -6773,6 +8382,20 @@ class MonitorEngine:
             )
             async with bcli_refresh.session_scope():
                 aw_fresh, _ = await bcli_refresh.fetch_aweme_by_work(note_id, with_play_url=True)
+            if aw_fresh and aw_fresh.medias:
+                aw = aw_fresh
+                ok, path, err = await self.downloader.download_aweme(
+                    aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
+                    cookies=download_cookies, referer=download_referer)
+        elif not ok and platform == "instagram" and not needs_ig_refetch and "403" in str(err):
+            icli_refresh = InstagramClient(
+                acc_state,
+                download_ua or self.cfg.engine.user_agent,
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+            )
+            async with icli_refresh.session_scope():
+                aw_fresh, _raw_m, _ = await icli_refresh.fetch_media_info(note_id)
             if aw_fresh and aw_fresh.medias:
                 aw = aw_fresh
                 ok, path, err = await self.downloader.download_aweme(
@@ -6804,7 +8427,7 @@ class MonitorEngine:
                 record = s.get(ContentRecord, rid)
                 if record is None:
                     continue
-                if record.platform == "xhs":
+                if record.platform in {"xhs", "rednote"}:
                     media = _loads(record.media_json)
                     if not isinstance(media, list) or not any(
                             isinstance(item, dict) and isinstance(item.get("url"), str)

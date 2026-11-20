@@ -25,12 +25,22 @@ from ..browser import (
     fetch_xhs_note_detail,
     fetch_xhs_notes,
     fetch_xhs_search,
+    fetch_rednote_comments,
+    fetch_rednote_favorites,
+    fetch_rednote_note_detail,
+    fetch_rednote_notes,
+    fetch_rednote_search,
 )
 from ..browser.tiktok_fetcher import fetch_tiktok_comments, fetch_tiktok_search
 from ..browser.bili_fetcher import (
     fetch_bili_comments,
     fetch_bili_search,
     fetch_bili_videos,
+)
+from ..browser.ig_fetcher import (
+    fetch_ig_comments,
+    fetch_ig_posts,
+    fetch_ig_search,
 )
 from ..db import get_session
 from ..models import (
@@ -59,6 +69,12 @@ from ..platforms.bilibili import (
     parse_bili_aweme,
     resolve_bili_mid,
 )
+from ..platforms.instagram import (
+    InstagramClient,
+    cookie_map_from_state as ig_cookie_map,
+    parse_ig_aweme,
+    resolve_ig_user_target,
+)
 from ..platforms.channels import (
     ChannelsProtocolClient,
     flatten_channels_comments,
@@ -73,6 +89,15 @@ from ..platforms.xhs import (
     parse_comment as parse_xhs_comment,
     parse_note_brief,
     parse_note_detail,
+)
+from ..platforms.rednote import (
+    RednoteApiClient,
+    cookie_str_from_state as rednote_cookie_str_from_state,
+    flatten_rednote_comments,
+    has_a1 as rednote_has_a1,
+    parse_rednote_brief,
+    parse_rednote_comment,
+    parse_rednote_detail,
 )
 from ..risk import classify_platform_error, RiskCategory
 from ..transport_matrix import douyin_client_environment
@@ -171,6 +196,13 @@ def _author_id(raw: dict, platform: str) -> str:
     if platform == "bilibili":
         owner = raw.get("owner") if isinstance(raw.get("owner"), dict) else {}
         return str(owner.get("mid") or raw.get("mid") or "")
+    if platform == "rednote":
+        return str((parse_rednote_brief(raw) or {}).get("author_id") or "")
+    if platform == "instagram":
+        user = raw.get("user") if isinstance(raw.get("user"), dict) else (
+            raw.get("owner") if isinstance(raw.get("owner"), dict) else {}
+        )
+        return str(user.get("username") or user.get("pk") or user.get("id") or raw.get("author_unique_id") or "")
     return str((parse_note_brief(raw) or {}).get("author_id") or "")
 
 
@@ -329,6 +361,10 @@ class KeywordCollector:
             self.cfg.engine.xhs_read_mode == "browser"
             and callable(getattr(self.browser, "visible_page", None))
         )
+
+    def _rednote_read_mode(self) -> str:
+        mode = str(getattr(self.cfg.engine, "rednote_read_mode", "hybrid") or "hybrid").lower()
+        return mode if mode in {"browser", "hybrid", "api"} else "hybrid"
 
     def _channels_read_mode(self) -> str:
         mode = str(getattr(self.cfg.engine, "channels_read_mode", "auto") or "auto").lower()
@@ -860,6 +896,206 @@ class KeywordCollector:
             card if isinstance(card, dict) else {}, brief, require_media=False)
         return aweme, {"brief": brief, "card": card or {}}, error
 
+    async def _discover_rednote_source(
+        self,
+        identity,
+        account,
+        keyword: str,
+        job: KeywordCollectionJob,
+        *,
+        rednote_client: RednoteApiClient | None = None,
+    ) -> tuple[list[dict], str]:
+        mode = self._rednote_read_mode()
+        items: list[dict] = []
+        err = ""
+        if mode in {"api", "hybrid"} and rednote_client is not None:
+            if job.source_type in {"favorite_all", "favorite_board"}:
+                items, err = await self._discover_xhs_favorites_api(rednote_client, job)
+            elif job.source_type == "creator":
+                items, err = await self._discover_xhs_creator_api(rednote_client, job)
+            else:
+                items, err = await self._discover_xhs(rednote_client, keyword, job)
+            if err:
+                err = err.replace("小红书", "海外小红书")
+            if items or mode == "api":
+                return items, err
+            if err and classify_platform_error(err)[0] in {
+                RiskCategory.AUTH,
+                RiskCategory.NETWORK,
+            }:
+                return [], err
+        elif mode == "api":
+            return [], "海外小红书 API 客户端不可用"
+
+        if job.source_type in {"favorite_all", "favorite_board"}:
+            values, b_err = await fetch_rednote_favorites(
+                self.browser,
+                identity,
+                str(getattr(account, "sec_uid", "") or ""),
+                board_id=job.source_ref if job.source_type == "favorite_board" else "",
+                board_name=job.source_name,
+                max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+                stagnant_limit=max(1, min(8, int(job.stagnant_pages or 1))),
+            )
+            return values, b_err
+        if job.source_type == "creator":
+            values, _author, b_err = await fetch_rednote_notes(
+                self.browser,
+                identity,
+                job.source_ref,
+                set(),
+                max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+                block_media=self.cfg.engine.block_media_resources,
+                ssr_fallback=True,
+            )
+            return values[: job.max_contents_per_keyword], b_err
+        values, b_err = await fetch_rednote_search(
+            self.browser,
+            identity,
+            keyword,
+            set(),
+            max_scrolls=max(1, min(40, int(job.max_pages_per_keyword or 1))),
+            stagnant_limit=max(1, min(8, int(job.stagnant_pages or 1))),
+            search_sort=job.search_sort,
+            content_type=job.content_type,
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        return _sort_xhs_search_items(values, job.search_sort), b_err
+
+    async def _materialize_rednote(
+        self,
+        identity,
+        raw: dict,
+        *,
+        rednote_client: RednoteApiClient | None = None,
+    ) -> tuple[Aweme | None, dict, str]:
+        brief = parse_rednote_brief(raw)
+        if not brief:
+            return None, {}, "搜索结果缺少 note_id"
+        mode = self._rednote_read_mode()
+        card: dict = {}
+        error = ""
+        if mode in {"api", "hybrid"} and rednote_client is not None:
+            try:
+                card = await rednote_client.note_detail(
+                    brief["note_id"],
+                    xsec_token=brief.get("xsec_token", ""),
+                    xsec_source=brief.get("xsec_source") or "pc_search",
+                )
+            except Exception as exc:
+                error = f"详情抓取失败: {exc}"
+            if (
+                not card
+                and mode == "hybrid"
+                and (
+                    not error
+                    or classify_platform_error(error)[0]
+                    not in {RiskCategory.AUTH, RiskCategory.NETWORK}
+                )
+            ):
+                b_card, b_err = await fetch_rednote_note_detail(
+                    self.browser,
+                    identity,
+                    brief["note_id"],
+                    xsec_token=brief.get("xsec_token", ""),
+                    xsec_source=brief.get("xsec_source") or "pc_search",
+                    block_media=self.cfg.engine.block_media_resources,
+                    keep_context=True,
+                )
+                if b_card:
+                    card, error = b_card, ""
+                elif b_err:
+                    error = b_err
+        elif mode == "api":
+            error = "详情抓取失败: 海外小红书 API 客户端不可用"
+        else:
+            b_card, error = await fetch_rednote_note_detail(
+                self.browser,
+                identity,
+                brief["note_id"],
+                xsec_token=brief.get("xsec_token", ""),
+                xsec_source=brief.get("xsec_source") or "pc_search",
+                block_media=self.cfg.engine.block_media_resources,
+            )
+            card = b_card if isinstance(b_card, dict) else {}
+        aweme = parse_rednote_detail(
+            card if isinstance(card, dict) else {}, brief, require_media=False
+        )
+        return aweme, {"brief": brief, "card": card or {}}, error
+
+    async def _rednote_comments(
+        self,
+        identity,
+        note_id: str,
+        xsec_token: str,
+        xsec_source: str,
+        limit: int,
+        include_replies: bool,
+        *,
+        rednote_client: RednoteApiClient | None = None,
+    ) -> tuple[list[dict], str]:
+        if limit <= 0:
+            return [], ""
+        mode = self._rednote_read_mode()
+        parsed: list[dict] = []
+        error = ""
+        if mode in {"api", "hybrid"} and rednote_client is not None:
+            try:
+                page = await rednote_client.collect_note_comments(
+                    note_id,
+                    xsec_token=xsec_token,
+                    xsec_source=xsec_source or "pc_search",
+                    max_comments=limit,
+                    max_requests=max(1, min(20, math.ceil(limit / 10) + 1)),
+                    include_replies=include_replies,
+                    request_interval=max(0.5, self.cfg.engine.xhs_item_gap_seconds),
+                )
+                parsed = [
+                    item
+                    for item in (parse_rednote_comment(v) for v in page["comments"])
+                    if item
+                ]
+            except Exception as exc:
+                error = f"评论抓取失败: {exc}"
+        if (
+            mode == "browser"
+            or (
+                mode == "hybrid"
+                and not parsed
+                and (
+                    rednote_client is None
+                    or (
+                        error
+                        and classify_platform_error(error)[0]
+                        not in {RiskCategory.AUTH, RiskCategory.NETWORK}
+                    )
+                )
+            )
+        ):
+            raw, b_error = await fetch_rednote_comments(
+                self.browser,
+                identity,
+                note_id,
+                set(),
+                xsec_token=xsec_token,
+                xsec_source=xsec_source or "pc_search",
+                max_scrolls=max(1, min(20, math.ceil(limit / 10) + 1)),
+                block_media=self.cfg.engine.block_media_resources,
+                keep_context=True,
+                include_replies=include_replies,
+            )
+            values = flatten_rednote_comments(raw) if include_replies else raw
+            b_parsed = [
+                item for item in (parse_rednote_comment(v) for v in values) if item
+            ]
+            if b_parsed or not b_error:
+                parsed, error = b_parsed, ""
+            else:
+                error = b_error
+        if not include_replies:
+            parsed = [item for item in parsed if not item.get("reply_to")]
+        return self._dedupe_comments(parsed, limit), error
+
     @staticmethod
     def _upsert_content(job: KeywordCollectionJob, keyword: str, aweme: Aweme,
                         author_id: str, xsec_token: str, xsec_source: str,
@@ -932,6 +1168,12 @@ class KeywordCollector:
             if account is not None:
                 download_cookies = bili_cookie_map(account.storage_state or account.cookie)
             download_referer = aweme.source_url or "https://www.bilibili.com/"
+        elif job.platform == "rednote":
+            download_referer = aweme.source_url or "https://www.rednote.com/"
+        elif job.platform == "instagram":
+            if account is not None:
+                download_ua = download_ua or str(getattr(account, "ua", "") or "")
+            download_referer = "https://www.instagram.com/"
         ok, local_path, error = await self.downloader.download_aweme(
             aweme, str(base_dir), routed_proxy,
             user_agent=download_ua,
@@ -1347,6 +1589,50 @@ class KeywordCollector:
                 return await self._run_keywords(
                     job_id, job, account, keywords, proxy,
                     identity=identity, bili_client=bili_client)
+        if job.platform == "rednote":
+            rn_mode = self._rednote_read_mode()
+            rn_state = (
+                (getattr(account, "storage_state", "") or getattr(account, "creator_storage_state", ""))
+                if account is not None
+                else ""
+            )
+            rn_cookie = rednote_cookie_str_from_state(rn_state)
+            rednote_client = None
+            if rn_mode in {"api", "hybrid"}:
+                if rednote_has_a1(rn_cookie):
+                    rednote_client = RednoteApiClient(
+                        rn_cookie,
+                        self._direct_request_ua(identity),
+                        timeout=self.cfg.engine.request_timeout_seconds,
+                        proxy=proxy,
+                        storage_state=rn_state,
+                    )
+                elif rn_mode == "api":
+                    raise RuntimeError("海外小红书登录态缺少 a1，请重新扫码登录或切换为浏览器读取模式")
+            self._progress(job_id, step="启动海外小红书采集任务")
+            if rednote_client is not None:
+                async with rednote_client.session_scope():
+                    return await self._run_keywords(
+                        job_id, job, account, keywords, proxy,
+                        identity=identity, rednote_client=rednote_client)
+            return await self._run_keywords(
+                job_id, job, account, keywords, proxy,
+                identity=identity, rednote_client=None)
+        if job.platform == "instagram":
+            ig_state = (account.storage_state or account.cookie) if account is not None else ""
+            ig_client = InstagramClient(
+                ig_state,
+                getattr(identity, "ua", "") or self.cfg.engine.user_agent,
+                proxy=proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+                account_seed=(getattr(account, "fp_seed", "") or str(getattr(account, "id", "") or "")),
+                timezone_id=(getattr(account, "timezone_id", "Asia/Shanghai") if account else "Asia/Shanghai"),
+            )
+            self._progress(job_id, step="启动 Instagram 采集任务")
+            async with ig_client.session_scope():
+                return await self._run_keywords(
+                    job_id, job, account, keywords, proxy,
+                    identity=identity, ig_client=ig_client)
         if xhs_client is not None:
             async with xhs_client.session_scope():
                 return await self._run_keywords(
@@ -1514,12 +1800,145 @@ class KeywordCollector:
             comments = [c for c in comments if not c.get("reply_to")]
         return comments[:limit], err
 
+    async def _discover_instagram_keyword(
+        self,
+        keyword: str,
+        job: KeywordCollectionJob,
+        *,
+        ig_client: InstagramClient | None,
+        identity=None,
+    ) -> tuple[list[dict], str]:
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        items: list[dict] = []
+        err = ""
+        max_pages = max(1, min(8, int(job.max_pages_per_keyword or 3)))
+        if mode in {"api", "hybrid"} and ig_client is not None:
+            items, err = await ig_client.search_posts(
+                keyword, max_pages=max_pages, sort=job.search_sort or "general"
+            )
+        if (mode == "browser" or (mode == "hybrid" and not items and not err.startswith(("logged_out:", "verification_required:")))) and identity is not None:
+            b_items, b_err = await fetch_ig_search(
+                self.browser, identity, keyword, max_scrolls=max_pages
+            )
+            if b_items:
+                items, err = b_items, ""
+            elif mode == "browser":
+                err = b_err
+        return items, err
+
+    async def _discover_instagram_creator(
+        self,
+        job: KeywordCollectionJob,
+        *,
+        ig_client: InstagramClient | None,
+        identity=None,
+    ) -> tuple[list[dict], str]:
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        user_ref = resolve_ig_user_target(job.source_ref) or str(job.source_ref or "").strip()
+        if not user_ref:
+            return [], "无法解析 Instagram 创作者用户名或链接"
+        items: list[dict] = []
+        err = ""
+        max_pages = max(1, min(10, int(job.max_pages_per_keyword or 3)))
+        if mode in {"api", "hybrid"} and ig_client is not None:
+            seen: set[str] = set()
+            cursor = ""
+            for _ in range(max_pages):
+                batch, next_cursor, more, f_err = await ig_client.fetch_user_feed(
+                    user_ref, max_id=cursor
+                )
+                if f_err:
+                    err = f_err
+                    break
+                for row in batch:
+                    code = str(row.get("code") or row.get("shortcode") or row.get("pk") or "")
+                    if code and code not in seen:
+                        seen.add(code)
+                        items.append(row)
+                if len(items) >= max(20, job.max_contents_per_keyword * 2) or not more or not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+        if (mode == "browser" or (mode == "hybrid" and not items and not err.startswith(("logged_out:", "verification_required:")))) and identity is not None:
+            b_items, _author, b_err = await fetch_ig_posts(
+                self.browser, identity, user_ref, set(), max_scrolls=max_pages
+            )
+            if b_items:
+                items, err = b_items, ""
+            elif mode == "browser":
+                err = b_err
+        return items, err
+
+    async def _discover_instagram_account(
+        self,
+        account,
+        job: KeywordCollectionJob,
+        *,
+        ig_client: InstagramClient | None,
+        identity=None,
+    ) -> tuple[list[dict], str]:
+        user_ref = str(
+            getattr(account, "douyin_id", "")
+            or getattr(account, "uid", "")
+            or getattr(account, "sec_uid", "")
+            or ""
+        ).strip()
+        if ig_client is not None and not user_ref:
+            prof, p_err = await ig_client.fetch_self_profile()
+            if p_err.startswith(("logged_out:", "verification_required:")):
+                return [], p_err
+            user_ref = str(prof.get("uid") or prof.get("unique_id") or ig_client.self_uid)
+        if not user_ref:
+            return [], "未获取到当前 Instagram 账号标识，请先在账号页刷新资料"
+        clone_job = KeywordCollectionJob(
+            platform="instagram",
+            account_id=getattr(account, "id", 0) or 0,
+            source_type="creator",
+            source_ref=user_ref,
+            max_contents_per_keyword=job.max_contents_per_keyword,
+            max_pages_per_keyword=job.max_pages_per_keyword,
+        )
+        return await self._discover_instagram_creator(
+            clone_job, ig_client=ig_client, identity=identity
+        )
+
+    async def _instagram_comments(
+        self,
+        identity,
+        work_id: str,
+        limit: int,
+        include_replies: bool,
+        *,
+        ig_client: InstagramClient | None = None,
+    ) -> tuple[list[dict], str]:
+        if limit <= 0:
+            return [], ""
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        comments: list[dict] = []
+        err = ""
+        if mode in {"api", "hybrid"} and ig_client is not None:
+            comments, err = await ig_client.fetch_comments(
+                work_id, max_count=limit, include_replies=include_replies
+            )
+        if (mode == "browser" or (mode == "hybrid" and not comments and err and not err.startswith(("logged_out:", "verification_required:")))) and identity is not None:
+            b_comments, b_err = await fetch_ig_comments(
+                self.browser, identity, work_id, max_count=limit, include_replies=include_replies
+            )
+            if b_comments:
+                comments, err = b_comments, ""
+            elif mode == "browser":
+                err = b_err
+        if not include_replies:
+            comments = [c for c in comments if not c.get("reply_to")]
+        return comments[:limit], err
+
     async def _run_keywords(self, job_id: int, job: KeywordCollectionJob,
                             account, keywords: list[str], proxy: str,
                              douyin_client: DouyinClient | None = None,
                              xhs_client: XhsApiClient | None = None,
+                             rednote_client: RednoteApiClient | None = None,
                              channels_client: ChannelsProtocolClient | None = None,
                              bili_client: BilibiliClient | None = None,
+                             ig_client: InstagramClient | None = None,
                              context=None, identity=None) -> dict:
 
         browser_reads = self._xhs_browser_reads_enabled()
@@ -1536,7 +1955,7 @@ class KeywordCollector:
                 gap = max(0.0, float(self.cfg.engine.douyin_keyword_gap_seconds))
                 if gap:
                     await asyncio.sleep(gap * random.uniform(1.0, 1.35))
-            elif job.platform == "xhs" and keyword_index:
+            elif job.platform in {"xhs", "rednote"} and keyword_index:
                 await self._xhs_gap(
                     self.cfg.engine.xhs_keyword_gap_seconds)
             elif job.platform in {"kuaishou", "shipinhao"} and keyword_index:
@@ -1545,14 +1964,16 @@ class KeywordCollector:
                 await asyncio.sleep(1.0 * random.uniform(1.0, 1.35))
             elif job.platform == "bilibili" and keyword_index:
                 await asyncio.sleep(0.8 * random.uniform(1.0, 1.35))
+            elif job.platform == "instagram" and keyword_index:
+                await asyncio.sleep(1.2 * random.uniform(1.0, 1.35))
             self._progress(
                 job_id,
                 keyword=keyword,
                 step=(
                     "同步本账号作品"
-                    if (job.platform in {"shipinhao", "bilibili"} and job.source_type == "account_works")
+                    if (job.platform in {"shipinhao", "bilibili", "instagram"} and job.source_type == "account_works")
                     else "读取创作者作品"
-                    if (job.platform in {"shipinhao", "bilibili"} and job.source_type == "creator")
+                    if (job.platform in {"shipinhao", "bilibili", "instagram"} and job.source_type == "creator")
                     else "搜索作品"
                 ),
                 processed_keyword_count=keyword_index,
@@ -1587,6 +2008,16 @@ class KeywordCollector:
                 else:
                     raw_items, search_error = await self._discover_bilibili_keyword(
                         keyword, job, bili_client=bili_client, identity=identity)
+            elif job.platform == "instagram":
+                if job.source_type == "creator":
+                    raw_items, search_error = await self._discover_instagram_creator(
+                        job, ig_client=ig_client, identity=identity)
+                elif job.source_type == "account_works":
+                    raw_items, search_error = await self._discover_instagram_account(
+                        account, job, ig_client=ig_client, identity=identity)
+                else:
+                    raw_items, search_error = await self._discover_instagram_keyword(
+                        keyword, job, ig_client=ig_client, identity=identity)
             elif job.platform == "shipinhao":
                 if job.source_type == "creator":
                     raw_items, search_error = await self._discover_channels_creator(
@@ -1597,6 +2028,9 @@ class KeywordCollector:
                 else:
                     raw_items, search_error = await self._discover_channels_account(
                         identity, job, account=account, proto_client=channels_client)
+            elif job.platform == "rednote":
+                raw_items, search_error = await self._discover_rednote_source(
+                    identity, account, keyword, job, rednote_client=rednote_client)
             elif browser_reads:
                 if job.source_type in {"favorite_all", "favorite_board"}:
                     raw_items, search_error = await self._discover_xhs_favorites_browser(
@@ -1651,7 +2085,7 @@ class KeywordCollector:
                     current_item_index=index,
                     current_item_total=len(candidates),
                 )
-                if job.platform == "xhs" and index > 1:
+                if job.platform in {"xhs", "rednote"} and index > 1:
                     await self._xhs_gap(self.cfg.engine.xhs_item_gap_seconds)
                 detail_error = ""
                 detail_raw = raw
@@ -1720,6 +2154,30 @@ class KeywordCollector:
                         if play_err and not aweme.medias:
                             detail_error = play_err
                     token = ""
+                elif job.platform == "rednote":
+                    aweme, parts, detail_error = await self._materialize_rednote(
+                        identity, raw, rednote_client=rednote_client)
+                    brief = parts.get("brief") or {}
+                    card = parts.get("card") or {}
+                    detail_raw = card or raw
+                    token = brief.get("xsec_token") or ""
+                    source = brief.get("xsec_source") or (
+                        "pc_feed" if job.source_type == "creator" else
+                        "pc_user" if job.source_type != "keyword" else "pc_search")
+                elif job.platform == "instagram":
+                    aweme = parse_ig_aweme(raw, require_media=False)
+                    if (
+                        aweme is not None
+                        and (not aweme.medias or (aweme.media_type == "video" and not any(m.kind == "video" for m in aweme.medias)))
+                        and ig_client is not None
+                    ):
+                        full_aw, full_raw, info_err = await ig_client.fetch_media_info(aweme.aweme_id)
+                        if full_aw is not None:
+                            aweme = full_aw
+                            detail_raw = full_raw
+                        elif info_err and job.download_media and not aweme.medias:
+                            detail_error = info_err
+                    token = ""
                 elif browser_reads:
                     aweme, parts, detail_error = \
                         await self._materialize_xhs_browser(identity, raw)
@@ -1739,7 +2197,7 @@ class KeywordCollector:
                     source = brief.get("xsec_source") or (
                         "pc_feed" if job.source_type == "creator" else
                         "pc_user" if job.source_type != "keyword" else "pc_search")
-                if job.platform == "xhs" and detail_error:
+                if job.platform in {"xhs", "rednote"} and detail_error:
                     category, _ = classify_platform_error(detail_error)
                     if category in {
                             RiskCategory.RISK, RiskCategory.AUTH,
@@ -1752,13 +2210,13 @@ class KeywordCollector:
                 if aweme is None:
                     self._record_error(job_id, f"{keyword}: 无法解析一条搜索结果")
                     continue
-                if job.platform in {"xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"} and not \
+                if job.platform in {"xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"} and not \
                         _collection_content_matches(aweme, job):
                     continue
 
                 current = self._job(job_id)
                 author_id = _author_id(detail_raw, job.platform)
-                if job.platform == "xhs" and not author_id:
+                if job.platform in {"xhs", "rednote"} and not author_id:
                     author_id = brief.get("author_id") or ""
                 if (job.platform == "shipinhao" and not author_id
                         and job.source_type == "account_works"):
@@ -1838,6 +2296,16 @@ class KeywordCollector:
                             identity, aweme.aweme_id,
                             job.max_comments_per_content, job.include_replies,
                             bili_client=bili_client)
+                    elif job.platform == "rednote":
+                        comments, comment_error = await self._rednote_comments(
+                            identity, aweme.aweme_id, token, source,
+                            job.max_comments_per_content, job.include_replies,
+                            rednote_client=rednote_client)
+                    elif job.platform == "instagram":
+                        comments, comment_error = await self._instagram_comments(
+                            identity, aweme.aweme_id,
+                            job.max_comments_per_content, job.include_replies,
+                            ig_client=ig_client)
                     elif browser_reads:
                         comments, comment_error = await self._xhs_comments_browser(
                             identity, aweme.aweme_id, token, source,
@@ -1862,13 +2330,13 @@ class KeywordCollector:
                     if comment_error:
                         self._record_error(
                             job_id, f"{keyword}/{aweme.aweme_id}: {comment_error}")
-                        if job.platform in {"xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"} and classify_platform_error(
+                        if job.platform in {"xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"} and classify_platform_error(
                                 comment_error)[0] in {
                                 RiskCategory.RISK, RiskCategory.AUTH,
                                 RiskCategory.NETWORK}:
                             return self._result(job_id, stopped=True)
                 self._refresh_counts(job_id)
-                if job.platform != "xhs":
+                if job.platform not in {"xhs", "rednote"}:
                     await asyncio.sleep(0.4)
                 if accepted >= job.max_contents_per_keyword:
                     break

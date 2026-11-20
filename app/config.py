@@ -1,4 +1,4 @@
-"""配置加载。对应逆向 internal/config。"""
+"""全局配置模型与 YAML 加载校验。"""
 from __future__ import annotations
 
 import os
@@ -60,12 +60,17 @@ class EngineConfig:
     xhs_cdp_idle_seconds: int | None = None
     # 小红书读取默认使用常驻签名客户端直连；browser 保留为页面兼容模式。
     xhs_read_mode: str = "api"               # api | browser
+    # 海外小红书(Rednote)读取通道: hybrid=XYS/XYW+b1 直连优先、普通兼容失败回退页面(默认推荐); api=仅直连; browser=仅页面
+    rednote_read_mode: str = "hybrid"        # hybrid | api | browser
     douyin_read_mode: str = "hybrid"         # 默认 API 优先/浏览器回退；api=仅 API；browser=仅浏览器
     # native=纯 Python 离线签名直连；browser=已授权页面；auto=直连优先/页面回退。
     tiktok_read_mode: str = "native"          # native | auto | browser
     # B站读写通道: hybrid=WBI/Cookie直连优先、明确风控兼容失败时回退页面; api=仅直连; browser=仅页面
     bilibili_read_mode: str = "hybrid"        # hybrid | api | browser
     bilibili_write_mode: str = "hybrid"       # hybrid | api | browser
+    # Instagram 读写通道: hybrid=双栈协议直连优先、兼容失败回退页面; api=仅直连; browser=仅页面
+    instagram_read_mode: str = "hybrid"       # hybrid | api | browser
+    instagram_write_mode: str = "hybrid"      # hybrid | api | browser
     # 视频号读取模式: auto=优先桌面微信原生 Finder CDP 协议、回退创作者助手页面;
     # protocol=仅原生 Finder 协议; browser=仅创作者助手页面。
     channels_read_mode: str = "auto"          # auto | protocol | browser
@@ -87,6 +92,7 @@ class EngineConfig:
     xhs_item_gap_seconds: float = 2.5         # 相邻详情/评论读取的最小停顿
     xhs_request_jitter: float = 0.35          # 上述停顿的正向随机抖动比例
     xhs_publish_mode: str = "browser"       # browser | api(API 仅为显式兼容模式)
+    rednote_publish_mode: str = "browser"   # browser | api(API 为实验性 XYS+b1 纯协议直发通道)
     # 小红书 Web 私信。监控只读；命中规则后仍进入统一 DM 限速队列。
     xhs_dm_monitor_enabled: bool = False
     xhs_dm_poll_interval_seconds: int = 120
@@ -216,6 +222,9 @@ def load_config(path: str | None = None) -> Config:
         cfg.engine.xhs_read_mode = (
             xhs_read_mode if xhs_read_mode in {"browser", "api"}
             else "api")
+        for pub_name in ("xhs_publish_mode", "rednote_publish_mode"):
+            pub_val = str(getattr(cfg.engine, pub_name, "browser") or "browser").strip().lower()
+            setattr(cfg.engine, pub_name, pub_val if pub_val in {"browser", "api"} else "browser")
         tiktok_read_mode = str(
             cfg.engine.tiktok_read_mode or "native").strip().lower()
         cfg.engine.tiktok_read_mode = (
@@ -231,13 +240,20 @@ def load_config(path: str | None = None) -> Config:
         proxy_port = int(cfg.engine.channels_proxy_port or 2023)
         cfg.engine.channels_proxy_port = proxy_port if 1024 <= proxy_port <= 65535 else 2023
         for name, default in (
+                ("rednote_read_mode", "hybrid"),
+                ("bilibili_read_mode", "hybrid"),
+                ("bilibili_write_mode", "hybrid"),
                 ("douyin_read_mode", "hybrid"),
                 ("douyin_profile_mode", "hybrid"),
                 ("douyin_followers_mode", "hybrid"),
                 ("douyin_dm_sync_mode", "hybrid"),
                 ("douyin_creator_danmaku_mode", "hybrid"),
                 ("douyin_publish_mode", "browser"),
-                ("douyin_write_mode", "hybrid")):
+                ("douyin_write_mode", "hybrid"),
+                ("bilibili_read_mode", "hybrid"),
+                ("bilibili_write_mode", "hybrid"),
+                ("instagram_read_mode", "hybrid"),
+                ("instagram_write_mode", "hybrid")):
             mode = str(getattr(cfg.engine, name, default) or default).strip().lower()
             setattr(cfg.engine, name, mode if mode in {"hybrid", "api", "browser"}
                     else default)

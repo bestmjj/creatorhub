@@ -1,4 +1,4 @@
-"""抖音 Web 客户端。对应逆向 internal/douyin.NativeClient。
+"""抖音 Web API 异步直连客户端。
 负责:拼接公共参数 + a_bogus 签名 + 携带 Cookie 请求 douyin.com Web API。
 """
 from __future__ import annotations
@@ -1080,7 +1080,7 @@ class DouyinClient:
             cursor = nxt
         return out
 
-    # ── 用户资料(对应 NativeClient.FetchProfile)──
+    # ── 用户资料 ──
     async def fetch_self_profile(self) -> Optional[dict]:
         """读取当前 Cookie 对应账号，不依赖已知 sec_uid。"""
         data = await self._get_json(
@@ -1189,7 +1189,7 @@ class DouyinClient:
             "nickname": str(user.get("nickname") or ""),
         }
 
-    # ── 作品列表(对应 NativeClient.FetchVideoList)──
+    # ── 作品列表 ──
     async def fetch_video_list(self, sec_uid: str, max_cursor: int = 0,
                                count: int = 20) -> Dict[str, Any]:
         data = await self._get_json(
@@ -1212,7 +1212,7 @@ class DouyinClient:
 
     async def fetch_all_new_videos(self, sec_uid: str, known_ids: set,
                                    max_pages: int = 5) -> List[dict]:
-        """对应 NativeClient.FetchAllNewVideos:翻页直到遇到已知作品。"""
+        """按游标翻页抓取新增作品，遇到已知作品即停止。"""
         new_items: List[dict] = []
         cursor = 0
         for _ in range(max_pages):
@@ -1231,7 +1231,7 @@ class DouyinClient:
             cursor = page["max_cursor"]
         return new_items
 
-    # ── 作品详情(对应 NativeClient.FetchVideoDetail)──
+    # ── 作品详情 ──
     async def fetch_video_detail(self, aweme_id: str) -> Optional[dict]:
         data = await self._get_json(
             "/aweme/v1/web/aweme/detail/",
@@ -1244,7 +1244,7 @@ class DouyinClient:
         item, self.last_error = parse_detail_response(data, aweme_id)
         return item
 
-    # ── 评论(直连 comment/list + reply,分页拉全量;参考 CommentAll)──
+    # ── 评论(直连 comment/list + reply 分页拉取)──
     async def fetch_comments_page(self, aweme_id: str, cursor: int = 0,
                                   count: int = 20) -> dict:
         data = await self._get_json(
@@ -1464,16 +1464,35 @@ class DouyinClient:
         max_time = int(time.time())
         reported_total = 0
         stagnant_pages = 0
+        consecutive_empty_pages = 0
+        probed_below_time: Optional[int] = None
+        deep_fan_cap = lambda: (
+            not following and page_index >= 200 and len(seen) >= 3000
+        )
         for page_index in range(page_limit):
             page = await self._follow_page(path, user_id, sec_uid, offset, max_time,
                                            count, source_type=1)
+            if (not page and self.last_error and page_index > 0
+                    and not self.last_error.startswith(("logged_out", "api_signature:"))):
+                for attempt in range(2):
+                    if page_delay > 0:
+                        await asyncio.sleep(min(1.2, max(0.3, page_delay * (attempt + 2))))
+                    page = await self._follow_page(
+                        path, user_id, sec_uid, offset, max_time,
+                        count, source_type=1)
+                    if page or not self.last_error:
+                        break
             if not page and self.last_error:
+                if deep_fan_cap():
+                    self.last_error = f"platform_cap:{self.last_error}"
                 self.last_follow_meta.update(
                     complete=False, stop_reason=self.last_error)
                 break
             status_code = page.get("status_code")
             if status_code not in (None, 0, "0"):
-                self.last_error = f"api_status_{status_code}"
+                raw_err = f"api_status_{status_code}"
+                self.last_error = (f"platform_cap:{raw_err}"
+                                   if deep_fan_cap() else raw_err)
                 self.last_follow_meta.update(
                     complete=False, stop_reason=self.last_error)
                 break
@@ -1484,25 +1503,48 @@ class DouyinClient:
             new = 0
             fresh: List[dict] = []
             for u in users:
-                uid = str(u.get("uid") or u.get("sec_uid") or "")
+                raw_uid = str(u.get("uid") or "")
+                sec_u = str(u.get("sec_uid") or u.get("secUid") or "")
+                uid = sec_u if (not raw_uid or raw_uid == "0") else raw_uid
                 if uid and uid not in seen:
                     seen.add(uid)
                     fresh.append(u)
                     if collect:
                         out.append(u)
                     new += 1
+            consecutive_empty_pages = (consecutive_empty_pages + 1) if not users else 0
             has_more = bool(page.get("has_more"))
+            next_max_time, next_offset, cursor_advanced = (
+                self._next_follow_cursor(
+                    page, max_time, offset, count, len(users),
+                    first_page=(page_index == 0),
+                )
+                if has_more else (max_time, offset, False)
+            )
             reached_reported_total = (
                 has_more and (not users or new == 0)
                 and reported_total > 0 and len(seen) >= reported_total
             )
-            if reached_reported_total:
+            # 大粉丝量/老账号列表中常含已注销或平台隐藏用户，实际可拉取总数低于 reported_total；
+            # 当已抓到有效数据且末尾确认返回空数组、游标不再推进（或连续空页）时视为正常到底。
+            exhausted_empty_tail = (
+                has_more and len(seen) > 0 and not users
+                and (
+                    consecutive_empty_pages >= 3
+                    or (
+                        not cursor_advanced
+                        and (offset == 0 or probed_below_time == max_time or max_time <= 1)
+                    )
+                )
+            )
+            if reached_reported_total or exhausted_empty_tail:
                 has_more = False
             meta = {
                 "pages": page_index + 1,
                 "fetched": len(seen),
                 "has_more": has_more,
                 "complete": not has_more,
+                "capped": bool(not has_more and reported_total > len(seen) > 0),
                 "stop_reason": "complete" if not has_more else "paging",
             }
             self.last_follow_meta = meta
@@ -1512,16 +1554,22 @@ class DouyinClient:
                     await callback_result
             if not has_more:
                 break
-            next_max_time, next_offset, cursor_advanced = self._next_follow_cursor(
-                page, max_time, offset, count, len(users),
-                first_page=(page_index == 0),
-            )
             if not users or new == 0:
                 stagnant_pages += 1
+                if (not cursor_advanced and stagnant_pages < 3
+                        and len(seen) > 0 and max_time > 1
+                        and probed_below_time != max_time):
+                    probed_below_time = max_time
+                    next_max_time = max_time - 1
+                    next_offset = 0
+                    cursor_advanced = True
                 if not cursor_advanced or stagnant_pages >= 3:
-                    self.last_error = "pagination_stalled"
+                    self.last_error = (
+                        "platform_cap:pagination_stalled"
+                        if deep_fan_cap() else "pagination_stalled"
+                    )
                     self.last_follow_meta.update(
-                        complete=False, stop_reason="pagination_stalled")
+                        complete=False, stop_reason=self.last_error)
                     break
             else:
                 stagnant_pages = 0
